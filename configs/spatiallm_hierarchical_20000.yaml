@@ -1,0 +1,60 @@
+wandb_run_name: hierarchical_exp01_03
+
+base:
+  ### model
+  model_name_or_path: manycore-research/SpatialLM1.1-Qwen-0.5B
+  trust_remote_code: true
+
+  ### method
+  do_train: true
+  freeze_language_tower: false
+  freeze_point_tower: false
+  train_proj_only: false
+
+  ### dataset
+  dataset_dir: /data2/chenjq24/SpatialLM/spatiallm-dataset-link
+  template: spatiallm_qwen
+  num_bins: 1280
+  do_augmentation: false
+  random_rotation: true
+  cutoff_len: 8192
+  overwrite_cache: true
+  preprocessing_num_workers: 8
+  dataloader_num_workers: 8
+
+  ### output
+  logging_steps: 10
+  save_steps: 1200 # TOCHANGE
+  overwrite_output_dir: false
+  save_total_limit: 5
+
+  ### train
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  pure_bf16: false
+  bf16: true
+  fp16: false
+  tf32: true
+  ddp_timeout: 180000000
+  report_to: wandb
+  max_new_tokens: 4096
+
+  ### eval
+  val_size: 0.0001
+  per_device_eval_batch_size: 1
+  eval_strategy: steps
+  eval_steps: 2000 # TOCHANGE
+
+stage1:
+  dataset: spatiallm_stage1_region_train_20000
+  output_dir: saves/hierarchical/stage1_regions
+  num_train_epochs: 4
+
+stage2:
+  dataset: spatiallm_stage2_bbox_train_20000
+  output_dir: saves/hierarchical/stage2_bboxes
+  num_train_epochs: 4
+  model_name_or_path: AUTO_STAGE1_LATEST

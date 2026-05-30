@@ -360,3 +360,103 @@ class Bbox:
 
     def sort_key(self):
         return np.array([self.position_x, self.position_y])
+
+
+@dataclass
+class Region:
+    id: int
+    position_x: float
+    position_y: float
+    position_z: float
+    scale_x: float
+    scale_y: float
+    scale_z: float
+    entity_label: str = "region"
+
+    def __post_init__(self):
+        self.id = int(self.id)
+        self.position_x = float(self.position_x)
+        self.position_y = float(self.position_y)
+        self.position_z = float(self.position_z)
+        self.scale_x = abs(float(self.scale_x))
+        self.scale_y = abs(float(self.scale_y))
+        self.scale_z = abs(float(self.scale_z))
+
+    def rotate(self, angle: float):
+        rot_mat = R.from_rotvec([0, 0, angle]).as_matrix()
+        center = np.array([self.position_x, self.position_y, self.position_z])
+        new_center = rot_mat @ center
+        self.position_x = new_center[0]
+        self.position_y = new_center[1]
+        self.position_z = new_center[2]
+
+        cos_angle = abs(np.cos(angle))
+        sin_angle = abs(np.sin(angle))
+        scale_x = self.scale_x
+        scale_y = self.scale_y
+        self.scale_x = cos_angle * scale_x + sin_angle * scale_y
+        self.scale_y = sin_angle * scale_x + cos_angle * scale_y
+
+    def translate(self, translation: np.ndarray):
+        self.position_x += translation[0]
+        self.position_y += translation[1]
+        self.position_z += translation[2]
+
+    def scale(self, scaling: float):
+        self.scale_x *= scaling
+        self.scale_y *= scaling
+        self.scale_z *= scaling
+        self.position_x *= scaling
+        self.position_y *= scaling
+        self.position_z *= scaling
+
+    def normalize_and_discretize(self, num_bins):
+        world_min, world_max = NORMALIZATION_PRESET["world"]
+        scale_min, scale_max = NORMALIZATION_PRESET["scale"]
+
+        self.position_x = (
+            (self.position_x - world_min) / (world_max - world_min) * num_bins
+        )
+        self.position_y = (
+            (self.position_y - world_min) / (world_max - world_min) * num_bins
+        )
+        self.position_z = (
+            (self.position_z - world_min) / (world_max - world_min) * num_bins
+        )
+        self.scale_x = (self.scale_x - scale_min) / (scale_max - scale_min) * num_bins
+        self.scale_y = (self.scale_y - scale_min) / (scale_max - scale_min) * num_bins
+        self.scale_z = (self.scale_z - scale_min) / (scale_max - scale_min) * num_bins
+
+        self.position_x = np.clip(int(self.position_x), 0, num_bins - 1)
+        self.position_y = np.clip(int(self.position_y), 0, num_bins - 1)
+        self.position_z = np.clip(int(self.position_z), 0, num_bins - 1)
+        self.scale_x = np.clip(int(self.scale_x), 0, num_bins - 1)
+        self.scale_y = np.clip(int(self.scale_y), 0, num_bins - 1)
+        self.scale_z = np.clip(int(self.scale_z), 0, num_bins - 1)
+
+    def undiscretize_and_unnormalize(self, num_bins):
+        world_min, world_max = NORMALIZATION_PRESET["world"]
+        scale_min, scale_max = NORMALIZATION_PRESET["scale"]
+
+        self.position_x = self.position_x / num_bins
+        self.position_y = self.position_y / num_bins
+        self.position_z = self.position_z / num_bins
+        self.scale_x = self.scale_x / num_bins
+        self.scale_y = self.scale_y / num_bins
+        self.scale_z = self.scale_z / num_bins
+
+        self.position_x = self.position_x * (world_max - world_min) + world_min
+        self.position_y = self.position_y * (world_max - world_min) + world_min
+        self.position_z = self.position_z * (world_max - world_min) + world_min
+        self.scale_x = self.scale_x * (scale_max - scale_min) + scale_min
+        self.scale_y = self.scale_y * (scale_max - scale_min) + scale_min
+        self.scale_z = self.scale_z * (scale_max - scale_min) + scale_min
+
+    def to_language_string(self):
+        capitalized_label = self.entity_label.capitalize()
+        self.id = self.id % 1000
+        language_string = f"{self.entity_label}_{self.id}={capitalized_label}({self.position_x},{self.position_y},{self.position_z},{self.scale_x},{self.scale_y},{self.scale_z})"
+        return language_string
+
+    def sort_key(self):
+        return np.array([self.position_x, self.position_y])

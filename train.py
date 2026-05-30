@@ -17,6 +17,7 @@ import sys
 import random
 import subprocess
 from copy import deepcopy
+from pathlib import Path
 
 from spatiallm.tuner import trainer
 from spatiallm.tuner.framework import logging
@@ -37,6 +38,15 @@ def main():
         standalone = os.getenv("STANDALONE", "0").lower() in ["true", "1"]
 
         env = deepcopy(os.environ)
+        repo_root = str(Path(__file__).resolve().parent)
+        pythonpath = env.get("PYTHONPATH", "")
+        pythonpath_parts = [part for part in pythonpath.split(os.pathsep) if part]
+        if repo_root not in pythonpath_parts:
+            env["PYTHONPATH"] = (
+                repo_root
+                if not pythonpath
+                else f"{repo_root}{os.pathsep}{pythonpath}"
+            )
         if is_env_enabled("OPTIM_TORCH", "1"):
             # optimize DDP, see https://zhuanlan.zhihu.com/p/671834539
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -58,7 +68,7 @@ def main():
             check=True,
         )
         logger.info_rank0(f"Running command: {command}")
-        process = subprocess.run(command.split())
+        process = subprocess.run(command.split(), env=env)
         sys.exit(process.returncode)
     else:
         run_exp()

@@ -1,6 +1,13 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-from spatiallm.layout.entity import Wall, Door, Window, Bbox, NORMALIZATION_PRESET
+from spatiallm.layout.entity import (
+    Wall,
+    Door,
+    Window,
+    Bbox,
+    Region,
+    NORMALIZATION_PRESET,
+)
 
 
 class Layout:
@@ -9,6 +16,7 @@ class Layout:
         self.doors = []
         self.windows = []
         self.bboxes = []
+        self.regions = []
 
         if s:
             self.from_str(s)
@@ -105,6 +113,21 @@ class Layout:
                         **bbox_params,
                     )
                     self.bboxes.append(entity)
+                elif entity_label == Region.entity_label:
+                    region_args = [
+                        "position_x",
+                        "position_y",
+                        "position_z",
+                        "scale_x",
+                        "scale_y",
+                        "scale_z",
+                    ]
+                    region_params = dict(zip(region_args, params[0:6]))
+                    entity = Region(
+                        id=entity_id,
+                        **region_params,
+                    )
+                    self.regions.append(entity)
             except Exception as e:
                 continue
 
@@ -175,10 +198,26 @@ class Layout:
             }
             boxes.append(box)
 
+        for region in self.regions:
+            center = np.array(
+                [region.position_x, region.position_y, region.position_z]
+            )
+            scale = np.array([region.scale_x, region.scale_y, region.scale_z])
+            rotation = np.eye(3)
+            box = {
+                "id": region.id + 4000,
+                "class": Region.entity_label,
+                "label": Region.entity_label,
+                "center": center,
+                "rotation": rotation,
+                "scale": scale,
+            }
+            boxes.append(box)
+
         return boxes
 
     def get_entities(self):
-        return self.walls + self.doors + self.windows + self.bboxes
+        return self.walls + self.doors + self.windows + self.bboxes + self.regions
 
     def normalize_and_discretize(self, num_bins):
         for entity in self.get_entities():
@@ -273,8 +312,10 @@ class Layout:
         sorted_doors = self.sort_entities(self.doors, wall_lookup)
         sorted_windows = self.sort_entities(self.windows, wall_lookup)
         sorted_bboxes = self.sort_entities(bboxes)
+        sorted_regions = self.sort_entities(self.regions)
 
         self.walls = sorted_walls
         self.doors = sorted_doors
         self.windows = sorted_windows
         self.bboxes = sorted_bboxes
+        self.regions = sorted_regions
