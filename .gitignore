@@ -181,6 +181,10 @@ grouding-dino/
 wandb/
 spatiallm-dataset-link
 
-tmp.*
-
 ours/scripts/
+configs/*.yaml
+!/data2/chenjq24/SpatialLM/configs/spatiallm_hierarchical_20000.yaml
+!/data2/chenjq24/SpatialLM/configs/spatiallm_sft.yaml
+
+tmp.*
+run.sh

@@ -4,15 +4,16 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from bbox import BBox3D
 from bbox.metrics import iou_3d
 from scipy.optimize import linear_sum_assignment
 
+from generate_region_bboxes import expand_region, make_regions, parse_bboxes
 from spatiallm import Layout
-from spatiallm.layout.entity import Bbox
+from spatiallm.layout.entity import Bbox, Region
 
 
 LARGE_COST_VALUE = 1e6
@@ -90,7 +91,68 @@ def load_bboxes(
     return bboxes
 
 
-def bbox_to_bbox3d(bbox: Bbox) -> BBox3D:
+def clamp_region_scale(region: Region, minimum_scale: float) -> Region:
+    region.scale_x = max(region.scale_x, minimum_scale)
+    region.scale_y = max(region.scale_y, minimum_scale)
+    region.scale_z = max(region.scale_z, minimum_scale)
+    return region
+
+
+def load_regions(path: Path, minimum_scale: float) -> List[Region]:
+    if not path.exists():
+        return []
+
+    layout = Layout(path.read_text())
+    return [clamp_region_scale(region, minimum_scale) for region in layout.regions]
+
+
+def generated_region_to_layout_region(index: int, region: Any) -> Region:
+    return Region(
+        id=index,
+        position_x=region.position_x,
+        position_y=region.position_y,
+        position_z=region.position_z,
+        scale_x=region.scale_x,
+        scale_y=region.scale_y,
+        scale_z=region.scale_z,
+    )
+
+
+def derive_gt_regions(
+    gt_path: Path,
+    k: int,
+    expand_fraction: float,
+    minimum_scale: float,
+) -> List[Region]:
+    if not gt_path.exists():
+        return []
+
+    raw_regions = make_regions(parse_bboxes(gt_path.read_text()), k)
+    expanded_regions = [expand_region(region, expand_fraction) for region in raw_regions]
+    return [
+        clamp_region_scale(generated_region_to_layout_region(index, region), minimum_scale)
+        for index, region in enumerate(expanded_regions)
+    ]
+
+
+def load_gt_regions(
+    scene_id: str,
+    gt_dir: Path,
+    gt_region_dir: Optional[Path],
+    k: int,
+    expand_fraction: float,
+    minimum_scale: float,
+) -> Tuple[List[Region], Path]:
+    if gt_region_dir is not None:
+        region_path = gt_region_dir / f"{scene_id}.txt"
+        if region_path.exists():
+            return load_regions(region_path, minimum_scale), region_path
+
+    gt_path = gt_dir / f"{scene_id}.txt"
+    return derive_gt_regions(gt_path, k, expand_fraction, minimum_scale), gt_path
+
+
+def bbox_to_bbox3d(bbox: Any) -> BBox3D:
     return BBox3D(
         bbox.position_x,
         bbox.position_y,
@@ -98,7 +160,7 @@ def bbox_to_bbox3d(bbox: Bbox) -> BBox3D:
         bbox.scale_x,
         bbox.scale_y,
         bbox.scale_z,
-        euler_angles=[0, 0, bbox.angle_z],
+        euler_angles=[0, 0, getattr(bbox, "angle_z", 0.0)],
         is_center=True,
     )
 
@@ -119,10 +181,10 @@ def compute_iou_matrix(pred_bboxes: List[Bbox], gt_bboxes: List[Bbox]) -> np.nda
     return iou_matrix
 
 
-def grouped_indices(bboxes: List[Bbox]) -> Dict[str, List[int]]:
+def grouped_indices(bboxes: List[Any]) -> Dict[str, List[int]]:
     groups = defaultdict(list)
     for index, bbox in enumerate(bboxes):
-        groups[bbox.class_name].append(index)
+        groups[getattr(bbox, "class_name", getattr(bbox, "entity_label", "entity"))].append(index)
     return groups
 
 
@@ -183,22 +245,20 @@ def best_iou_means(
     return mean_gt_best_iou, mean_pred_best_iou
 
 
-def format_bbox_ref(prefix: str, bbox: Bbox) -> str:
-    return f"{prefix}{bbox.id}:{bbox.class_name}"
+def format_bbox_ref(prefix: str, bbox: Any) -> str:
+    class_name = getattr(bbox, "class_name", getattr(bbox, "entity_label", "entity"))
+    return f"{prefix}{bbox.id}:{class_name}"
 
 
-def score_scene(
+def score_entities(
     scene_id: str,
     pred_path: Path,
     gt_path: Path,
-    class_map: Optional[Dict[str, str]],
-    drop_unmapped: bool,
-    minimum_scale: float,
+    pred_bboxes: List[Any],
+    gt_bboxes: List[Any],
     iou_threshold: float,
     class_aware: bool,
 ) -> SceneScore:
-    pred_bboxes = load_bboxes(pred_path, class_map, drop_unmapped, minimum_scale)
-    gt_bboxes = load_bboxes(gt_path, class_map, drop_unmapped, minimum_scale)
     iou_matrix = compute_iou_matrix(pred_bboxes, gt_bboxes)
     matches = match_bboxes(
         pred_bboxes, gt_bboxes, iou_matrix, iou_threshold, class_aware
@@ -265,6 +325,59 @@ def score_scene(
         matched_pairs=matched_pairs,
         unmatched_pred=unmatched_pred,
         unmatched_gt=unmatched_gt,
+    )
+
+
+def score_scene(
+    scene_id: str,
+    pred_path: Path,
+    gt_path: Path,
+    class_map: Optional[Dict[str, str]],
+    drop_unmapped: bool,
+    minimum_scale: float,
+    iou_threshold: float,
+    class_aware: bool,
+) -> SceneScore:
+    pred_bboxes = load_bboxes(pred_path, class_map, drop_unmapped, minimum_scale)
+    gt_bboxes = load_bboxes(gt_path, class_map, drop_unmapped, minimum_scale)
+    return score_entities(
+        scene_id,
+        pred_path,
+        gt_path,
+        pred_bboxes,
+        gt_bboxes,
+        iou_threshold,
+        class_aware,
+    )
+
+
+def score_region_scene(
+    scene_id: str,
+    pred_path: Path,
+    gt_dir: Path,
+    gt_region_dir: Optional[Path],
+    minimum_scale: float,
+    iou_threshold: float,
+    k: int,
+    expand_fraction: float,
+) -> SceneScore:
+    pred_regions = load_regions(pred_path, minimum_scale)
+    gt_regions, gt_path = load_gt_regions(
+        scene_id,
+        gt_dir,
+        gt_region_dir,
+        k,
+        expand_fraction,
+        minimum_scale,
+    )
+    return score_entities(
+        scene_id,
+        pred_path,
+        gt_path,
+        pred_regions,
+        gt_regions,
+        iou_threshold,
+        class_aware=False,
     )
 
 
@@ -356,9 +469,15 @@ def print_summary(scores: List[SceneScore]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Rank the worst prediction files by class-aware 3D bbox matching against "
-            "ground-truth layout files."
+            "Rank the worst prediction files by 3D IoU matching against ground-truth "
+            "layout or region files."
         )
+    )
+    parser.add_argument(
+        "--target",
+        choices=["bbox", "region"],
+        default="bbox",
+        help="Score object Bbox lines or first-stage Region lines.",
     )
     parser.add_argument(
         "--pred_dir",
@@ -371,6 +490,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/data2/chenjq24/SpatialLM/arkitscenes-spatiallm/layout"),
         help="Directory containing ground-truth layout .txt files.",
+    )
+    parser.add_argument(
+        "--gt_region_dir",
+        type=Path,
+        help=(
+            "Optional directory containing GT Region .txt files. Only used with "
+            "--target region. If omitted or a scene file is missing, GT regions are "
+            "derived from GT Bbox lines using --k and --expand_fraction."
+        ),
     )
     parser.add_argument(
         "--top_k",
@@ -406,7 +534,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class_agnostic",
         action="store_true",
-        help="Ignore class labels during matching.",
+        help="Ignore class labels during bbox matching. Region matching is always class-agnostic.",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=3,
+        help="K used when deriving GT regions from GT object bboxes.",
+    )
+    parser.add_argument(
+        "--expand_fraction",
+        type=float,
+        default=0.25,
+        help="Per-side expansion fraction used when deriving GT regions.",
     )
     parser.add_argument(
         "--scene_ids",
@@ -437,6 +577,14 @@ def parse_args() -> argparse.Namespace:
         "--output_csv",
         type=Path,
         help="Optional path for the selected worst-scene CSV.",
+    )
+    parser.add_argument(
+        "--output_all_csv",
+        type=Path,
+        help=(
+            "Optional path for a CSV containing every scored scene, sorted with "
+            "the same worst-first ordering as the selected CSV."
+        ),
     )
     parser.add_argument(
         "--output_scene_ids",
@@ -476,18 +624,32 @@ def main() -> None:
         if not gt_path.exists():
             missing_gt_count += 1
             continue
-        scores.append(
-            score_scene(
-                scene_id,
-                pred_path,
-                gt_path,
-                class_map,
-                args.drop_unmapped,
-                args.minimum_scale,
-                args.iou_threshold,
-                class_aware,
+        if args.target == "region":
+            scores.append(
+                score_region_scene(
+                    scene_id,
+                    pred_path,
+                    args.gt_dir,
+                    args.gt_region_dir,
+                    args.minimum_scale,
+                    args.iou_threshold,
+                    args.k,
+                    args.expand_fraction,
+                )
             )
-        )
+        else:
+            scores.append(
+                score_scene(
+                    scene_id,
+                    pred_path,
+                    gt_path,
+                    class_map,
+                    args.drop_unmapped,
+                    args.minimum_scale,
+                    args.iou_threshold,
+                    class_aware,
+                )
+            )
 
     scores.sort(
         key=lambda score: (
@@ -504,6 +666,8 @@ def main() -> None:
 
     if args.output_csv:
         write_csv(args.output_csv, selected_scores)
+    if args.output_all_csv:
+        write_csv(args.output_all_csv, scores)
     if args.output_scene_ids:
         write_scene_ids(args.output_scene_ids, selected_scores)
     if args.export_dir:
