@@ -140,6 +140,8 @@ def load_model(
     init_kwargs = _get_init_kwargs(model_args)
     config = load_config(model_args)
     config.point_config["num_bins"] = data_args.num_bins
+    config.point_config["world_size"] = data_args.world_size
+    config.point_config["max_point_tokens"] = data_args.max_point_tokens
     patch_config(config, model_args, init_kwargs, is_trainable)
 
     init_kwargs["config"] = config

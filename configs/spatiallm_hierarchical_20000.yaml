@@ -1,4 +1,4 @@
-wandb_run_name: hierarchical_exp01_03
+wandb_run_name: GPU05_hierarchical_exp01_03
 
 base:
   ### model

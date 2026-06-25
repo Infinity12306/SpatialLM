@@ -6,7 +6,7 @@ from spatiallm.layout.entity import (
     Window,
     Bbox,
     Region,
-    NORMALIZATION_PRESET,
+    get_world_preset,
 )
 
 
@@ -22,8 +22,8 @@ class Layout:
             self.from_str(s)
 
     @staticmethod
-    def get_grid_size(num_bins):
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+    def get_grid_size(num_bins, world_size: float | None = None):
+        world_min, world_max = get_world_preset(world_size)
         return (world_max - world_min) / num_bins
 
     def from_str(self, s: str):
@@ -219,13 +219,13 @@ class Layout:
     def get_entities(self):
         return self.walls + self.doors + self.windows + self.bboxes + self.regions
 
-    def normalize_and_discretize(self, num_bins):
+    def normalize_and_discretize(self, num_bins, world_size: float | None = None):
         for entity in self.get_entities():
-            entity.normalize_and_discretize(num_bins)
+            entity.normalize_and_discretize(num_bins, world_size=world_size)
 
-    def undiscretize_and_unnormalize(self, num_bins):
+    def undiscretize_and_unnormalize(self, num_bins, world_size: float | None = None):
         for entity in self.get_entities():
-            entity.undiscretize_and_unnormalize(num_bins)
+            entity.undiscretize_and_unnormalize(num_bins, world_size=world_size)
 
     def translate(self, translation: np.ndarray):
         for entity in self.get_entities():

@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from spatiallm.layout.layout import Layout
-from spatiallm.layout.entity import NORMALIZATION_PRESET
+from spatiallm.layout.entity import get_world_preset
 from spatiallm.pcd import load_o3d_pcd, get_points_and_colors
 from spatiallm.pcd.transform import Compose
 
@@ -29,13 +29,19 @@ class SpatialLMPlugin:
         self,
         point_token: str = "<|point_pad|>",
         num_bins: int = 1280,
+        world_size: float = 32.0,
         do_augmentation: bool = False,
         random_rotation: bool = False,
     ):
         self.point_token = point_token
 
-        global_extent = NORMALIZATION_PRESET["world"]
+        default_world_extent = get_world_preset()
+        global_extent = get_world_preset(world_size)
         self.num_bins = num_bins
+        self.world_size = float(global_extent[1] - global_extent[0])
+        self.center_crop_enabled = self.world_size < (
+            default_world_extent[1] - default_world_extent[0]
+        )
         self.grid_size = (global_extent[1] - global_extent[0]) / self.num_bins
         self.do_augmentation = do_augmentation
         self.random_rotation = random_rotation
@@ -74,6 +80,39 @@ class SpatialLMPlugin:
                 ),
             ]
         )
+
+    def _center_crop_to_world_size(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
+        min_bound = points.min(axis=0)
+        max_bound = points.max(axis=0)
+        extent = max_bound - min_bound
+        if (not self.center_crop_enabled) or np.all(extent <= self.world_size):
+            return points, colors, {
+                "center_cropped": False,
+                "crop_min_bound": min_bound,
+                "crop_max_bound": max_bound,
+            }
+
+        crop_center = (min_bound + max_bound) * 0.5
+        crop_half_size = np.full(3, self.world_size * 0.5, dtype=np.float64)
+        crop_min_bound = crop_center - crop_half_size
+        crop_max_bound = crop_center + crop_half_size
+        crop_mask = np.all(
+            (points >= crop_min_bound) & (points <= crop_max_bound),
+            axis=1,
+        )
+        if not np.any(crop_mask):
+            nearest_index = int(np.argmin(np.sum((points - crop_center) ** 2, axis=1)))
+            crop_mask[nearest_index] = True
+
+        return points[crop_mask], colors[crop_mask], {
+            "center_cropped": True,
+            "crop_min_bound": crop_min_bound,
+            "crop_max_bound": crop_max_bound,
+        }
 
     def _preprocess_point_cloud(self, point_cloud: dict) -> np.ndarray:
         r"""
@@ -143,6 +182,10 @@ class SpatialLMPlugin:
             center_pt = (min_bound + max_bound) / 2
             scaled_points = (points - center_pt) * scaling
             transformed_points = (rotmat @ scaled_points.T).T + center_pt
+            transformed_points, colors, crop_info = self._center_crop_to_world_size(
+                transformed_points,
+                colors,
+            )
             # store transformation parameters for sync the augmentation to the layout
             transformations.append(
                 {
@@ -151,6 +194,7 @@ class SpatialLMPlugin:
                     "scaling": scaling,
                     "min_bound": np.min(transformed_points, axis=0),
                     "transformed_points": transformed_points,
+                    **crop_info,
                 }
             )
 
@@ -216,6 +260,9 @@ class SpatialLMPlugin:
                 center_pt = transformation["center_pt"]
                 scaling = transformation["scaling"]
                 transformed_points = transformation["transformed_points"]
+                center_cropped = transformation["center_cropped"]
+                crop_min_bound = transformation["crop_min_bound"]
+                crop_max_bound = transformation["crop_max_bound"]
                 layout_start_pos = content.index(LAYOUT_S_PLACEHOLDER)
                 layout_end_pos = content.index(LAYOUT_E_PLACEHOLDER)
                 layout_content = content[
@@ -228,10 +275,22 @@ class SpatialLMPlugin:
                 layout.scale(scaling)
                 layout.rotate(transformation["angle_z"])
                 layout.translate(center_pt)
+                if center_cropped:
+                    layout.bboxes = [
+                        bbox for bbox in layout.bboxes
+                        if (
+                            crop_min_bound[0] <= bbox.position_x <= crop_max_bound[0]
+                            and crop_min_bound[1] <= bbox.position_y <= crop_max_bound[1]
+                            and crop_min_bound[2] <= bbox.position_z <= crop_max_bound[2]
+                        )
+                    ]
                 layout.filter_empty_bboxes(transformed_points, num_points=100)
                 layout.reorder_entities()
                 layout.translate(-min_bound)
-                layout.normalize_and_discretize(self.num_bins)
+                layout.normalize_and_discretize(
+                    self.num_bins,
+                    world_size=self.world_size,
+                )
                 new_layout_content = layout.to_language_string()
                 content = content.replace(
                     f"{LAYOUT_S_PLACEHOLDER}{layout_content}{LAYOUT_E_PLACEHOLDER}",

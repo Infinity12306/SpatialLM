@@ -173,7 +173,7 @@ outputs/
 render/
 sam3.1/
 sam3/
-saves/
+saves
 spatialgen-testset/
 spatiallm-dataset/
 spatiallm-testset/
@@ -188,3 +188,6 @@ configs/*.yaml
 
 tmp.*
 run.sh
+run*.sh
+analyze_*.py
+nohup.out

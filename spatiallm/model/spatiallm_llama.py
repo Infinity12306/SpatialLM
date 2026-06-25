@@ -24,7 +24,11 @@ try:
 except ImportError:
     pass  # Ignore the import error if torchsparse is not installed for SpatialLM1.1
 
-from spatiallm.model import PointBackboneType, ProjectorType
+from spatiallm.model import (
+    PointBackboneType,
+    ProjectorType,
+    center_crop_point_tokens,
+)
 
 IGNORE_INDEX = -100
 logger = logging.get_logger(__name__)
@@ -46,6 +50,7 @@ class SpatialLMLlamaForCausalLM(LlamaForCausalLM):
         self.point_backbone_type = PointBackboneType(config.point_backbone)
         self.point_backbone = None
         point_config = config.point_config
+        self.max_point_tokens = point_config.get("max_point_tokens")
         if self.point_backbone_type == PointBackboneType.SCENESCRIPT:
             from spatiallm.model.scenescript_encoder import PointCloudEncoder
 
@@ -109,7 +114,11 @@ class SpatialLMLlamaForCausalLM(LlamaForCausalLM):
             pc_sparse_tensor = sparse_collate([pc_sparse_tensor])  # batch_size = 1
             pc_sparse_tensor = pc_sparse_tensor.to(device)
             encoded_features = self.point_backbone(pc_sparse_tensor)
-            return self.point_proj(encoded_features["context"].to(dtype))
+            point_features = center_crop_point_tokens(
+                encoded_features["context"],
+                self.max_point_tokens,
+            )
+            return self.point_proj(point_features.to(dtype))
         elif self.point_backbone_type == PointBackboneType.SONATA:
             input_dict = {
                 "coord": feats[:, :3].to(device),
@@ -118,6 +127,10 @@ class SpatialLMLlamaForCausalLM(LlamaForCausalLM):
                 "batch": torch.zeros(coords.shape[0], dtype=torch.long).to(device),
             }
             encoded_features = self.point_backbone(input_dict)
+            encoded_features = center_crop_point_tokens(
+                encoded_features,
+                self.max_point_tokens,
+            )
             # add the batch dimension
             encoded_features = encoded_features.unsqueeze(0)
             return self.point_proj(encoded_features.to(dtype))

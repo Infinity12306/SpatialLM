@@ -21,6 +21,12 @@ NORMALIZATION_PRESET = {
 }
 
 
+def get_world_preset(world_size: float | None = None) -> tuple[float, float]:
+    if world_size is None:
+        return NORMALIZATION_PRESET["world"]
+    return (0.0, float(world_size))
+
+
 @dataclass
 class Wall:
     id: int
@@ -77,9 +83,9 @@ class Wall:
         self.by *= scaling
         self.bz *= scaling
 
-    def normalize_and_discretize(self, num_bins):
+    def normalize_and_discretize(self, num_bins, world_size: float | None = None):
         height_min, height_max = NORMALIZATION_PRESET["height"]
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+        world_min, world_max = get_world_preset(world_size)
 
         self.height = (self.height - height_min) / (height_max - height_min) * num_bins
         self.thickness = (
@@ -101,9 +107,9 @@ class Wall:
         self.by = np.clip(int(self.by), 0, num_bins - 1)
         self.bz = np.clip(int(self.bz), 0, num_bins - 1)
 
-    def undiscretize_and_unnormalize(self, num_bins):
+    def undiscretize_and_unnormalize(self, num_bins, world_size: float | None = None):
         height_min, height_max = NORMALIZATION_PRESET["height"]
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+        world_min, world_max = get_world_preset(world_size)
 
         # undiscretize
         self.height = self.height / num_bins
@@ -188,10 +194,10 @@ class Door:
         self.position_y *= scaling
         self.position_z *= scaling
 
-    def normalize_and_discretize(self, num_bins):
+    def normalize_and_discretize(self, num_bins, world_size: float | None = None):
         width_min, width_max = NORMALIZATION_PRESET["width"]
         height_min, height_max = NORMALIZATION_PRESET["height"]
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+        world_min, world_max = get_world_preset(world_size)
 
         self.width = (self.width - width_min) / (width_max - width_min) * num_bins
         self.height = (self.height - height_min) / (height_max - height_min) * num_bins
@@ -211,10 +217,10 @@ class Door:
         self.position_y = np.clip(int(self.position_y), 0, num_bins - 1)
         self.position_z = np.clip(int(self.position_z), 0, num_bins - 1)
 
-    def undiscretize_and_unnormalize(self, num_bins):
+    def undiscretize_and_unnormalize(self, num_bins, world_size: float | None = None):
         width_min, width_max = NORMALIZATION_PRESET["width"]
         height_min, height_max = NORMALIZATION_PRESET["height"]
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+        world_min, world_max = get_world_preset(world_size)
 
         # undiscretize
         self.width = self.width / num_bins
@@ -303,8 +309,8 @@ class Bbox:
         self.position_y *= scaling
         self.position_z *= scaling
 
-    def normalize_and_discretize(self, num_bins):
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+    def normalize_and_discretize(self, num_bins, world_size: float | None = None):
+        world_min, world_max = get_world_preset(world_size)
         scale_min, scale_max = NORMALIZATION_PRESET["scale"]
         angle_min, angle_max = NORMALIZATION_PRESET["angle"]
 
@@ -330,8 +336,8 @@ class Bbox:
         self.scale_y = np.clip(int(self.scale_y), 0, num_bins - 1)
         self.scale_z = np.clip(int(self.scale_z), 0, num_bins - 1)
 
-    def undiscretize_and_unnormalize(self, num_bins):
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+    def undiscretize_and_unnormalize(self, num_bins, world_size: float | None = None):
+        world_min, world_max = get_world_preset(world_size)
         scale_min, scale_max = NORMALIZATION_PRESET["scale"]
         angle_min, angle_max = NORMALIZATION_PRESET["angle"]
 
@@ -410,8 +416,8 @@ class Region:
         self.position_y *= scaling
         self.position_z *= scaling
 
-    def normalize_and_discretize(self, num_bins):
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+    def normalize_and_discretize(self, num_bins, world_size: float | None = None):
+        world_min, world_max = get_world_preset(world_size)
         scale_min, scale_max = NORMALIZATION_PRESET["scale"]
 
         self.position_x = (
@@ -434,8 +440,8 @@ class Region:
         self.scale_y = np.clip(int(self.scale_y), 0, num_bins - 1)
         self.scale_z = np.clip(int(self.scale_z), 0, num_bins - 1)
 
-    def undiscretize_and_unnormalize(self, num_bins):
-        world_min, world_max = NORMALIZATION_PRESET["world"]
+    def undiscretize_and_unnormalize(self, num_bins, world_size: float | None = None):
+        world_min, world_max = get_world_preset(world_size)
         scale_min, scale_max = NORMALIZATION_PRESET["scale"]
 
         self.position_x = self.position_x / num_bins

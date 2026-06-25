@@ -110,6 +110,7 @@ def run_sft(
     register_spatiallm_templates(
         cutoff_len=data_args.cutoff_len,
         num_bins=data_args.num_bins,
+        world_size=data_args.world_size,
         do_augmentation=data_args.do_augmentation,
         random_rotation=data_args.random_rotation,
     )

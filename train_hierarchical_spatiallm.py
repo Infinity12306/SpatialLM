@@ -59,6 +59,24 @@ def apply_optional_int_override(
         stage_config[key] = value
 
 
+def apply_optional_float_override(
+    stage_config: dict[str, Any],
+    key: str,
+    value: float | None,
+) -> None:
+    if value is not None:
+        stage_config[key] = value
+
+
+def apply_optional_str_override(
+    stage_config: dict[str, Any],
+    key: str,
+    value: str | None,
+) -> None:
+    if value is not None:
+        stage_config[key] = value
+
+
 def latest_checkpoint(output_dir: Path) -> Path:
     if not output_dir.exists():
         raise FileNotFoundError(f"Stage output directory does not exist: {output_dir}")
@@ -116,6 +134,8 @@ def run_stage(train_script: Path, stage_name: str, stage_config: dict[str, Any])
     print(f"[{stage_name}] config: {config_path}")
     print(f"[{stage_name}] dataset: {stage_config.get('dataset')}")
     print(f"[{stage_name}] output_dir: {stage_config.get('output_dir')}")
+    print(f"[{stage_name}] world_size: {stage_config.get('world_size')}")
+    print(f"[{stage_name}] max_point_tokens: {stage_config.get('max_point_tokens')}")
     print(f"[{stage_name}] save_steps: {stage_config.get('save_steps')}")
     print(f"[{stage_name}] eval_steps: {stage_config.get('eval_steps')}")
     if stage_config.get("resume_from_checkpoint") is not None:
@@ -235,8 +255,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--stage1_save_steps", "--stage1-save-steps", type=int)
     parser.add_argument("--stage1_eval_steps", "--stage1-eval-steps", type=int)
+    parser.add_argument("--stage1_world_size", "--stage1-world-size", type=float)
+    parser.add_argument(
+        "--stage1_max_point_tokens",
+        "--stage1-max-point-tokens",
+        type=int,
+    )
+    parser.add_argument("--stage1_output_dir", "--stage1-output-dir", type=str)
     parser.add_argument("--stage2_save_steps", "--stage2-save-steps", type=int)
     parser.add_argument("--stage2_eval_steps", "--stage2-eval-steps", type=int)
+    parser.add_argument("--stage2_world_size", "--stage2-world-size", type=float)
+    parser.add_argument(
+        "--stage2_max_point_tokens",
+        "--stage2-max-point-tokens",
+        type=int,
+    )
+    parser.add_argument("--stage2_output_dir", "--stage2-output-dir", type=str)
     parser.add_argument(
         "--print_configs",
         "--print-configs",
@@ -297,8 +331,22 @@ def main() -> None:
 
     apply_optional_int_override(stage1_config, "save_steps", args.stage1_save_steps)
     apply_optional_int_override(stage1_config, "eval_steps", args.stage1_eval_steps)
+    apply_optional_float_override(stage1_config, "world_size", args.stage1_world_size)
+    apply_optional_int_override(
+        stage1_config,
+        "max_point_tokens",
+        args.stage1_max_point_tokens,
+    )
+    apply_optional_str_override(stage1_config, "output_dir", args.stage1_output_dir)
     apply_optional_int_override(stage2_config, "save_steps", args.stage2_save_steps)
     apply_optional_int_override(stage2_config, "eval_steps", args.stage2_eval_steps)
+    apply_optional_float_override(stage2_config, "world_size", args.stage2_world_size)
+    apply_optional_int_override(
+        stage2_config,
+        "max_point_tokens",
+        args.stage2_max_point_tokens,
+    )
+    apply_optional_str_override(stage2_config, "output_dir", args.stage2_output_dir)
 
     if args.print_configs:
         print(

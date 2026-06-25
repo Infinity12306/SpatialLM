@@ -14,11 +14,11 @@ POST_LAUNCH_WAIT_SEC=600  # 10 minutes
 OOM_KEYWORD="Error"
 
 COMMANDS=(
-    "bash finetune_arkit.sh"
+    "python train_hierarchical_spatiallm.py configs/spatiallm_hierarchical_20000_res_16.yaml"
 )
 
 LOG_FILES=(
-    "/data2/chenjq24/SpatialLM/logs/finetune/exp01_arkit.log"
+    "logs/two_stage/exp03_20000_res_16.log"
 )
 
 commands_from_args=false

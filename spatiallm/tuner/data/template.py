@@ -315,6 +315,7 @@ def register_template(
 def register_spatiallm_templates(
     cutoff_len: int = 8192,
     num_bins: int = 1280,
+    world_size: float = 32.0,
     do_augmentation: bool = False,
     random_rotation: bool = False,
 ):
@@ -338,6 +339,7 @@ def register_spatiallm_templates(
         mm_plugin=get_mm_plugin(
             point_token="<|point_pad|>",
             num_bins=num_bins,
+            world_size=world_size,
             do_augmentation=do_augmentation,
             random_rotation=random_rotation,
         ),
@@ -358,6 +360,7 @@ def register_spatiallm_templates(
         mm_plugin=get_mm_plugin(
             point_token="<|point_pad|>",
             num_bins=num_bins,
+            world_size=world_size,
             do_augmentation=do_augmentation,
             random_rotation=random_rotation,
         ),

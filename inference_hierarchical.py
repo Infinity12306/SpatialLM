@@ -157,12 +157,13 @@ def prepare_scene_point_cloud(
     pcd_path: Path,
     num_bins: int,
     no_cleanup: bool,
+    world_size: float = 32.0,
 ) -> PreparedPointCloud:
     if not pcd_path.exists():
         raise FileNotFoundError(f"Point cloud file not found: {pcd_path}")
 
     pcd = load_o3d_pcd(str(pcd_path))
-    grid_size = Layout.get_grid_size(num_bins)
+    grid_size = Layout.get_grid_size(num_bins, world_size=world_size)
     if not no_cleanup:
         pcd = cleanup_pcd(pcd, voxel_size=grid_size)
 
@@ -170,18 +171,19 @@ def prepare_scene_point_cloud(
     if points.shape[0] == 0:
         raise ValueError(f"Point cloud has no points: {pcd_path}")
 
-    return prepare_point_arrays(points, colors, num_bins)
+    return prepare_point_arrays(points, colors, num_bins, world_size=world_size)
 
 
 def prepare_point_arrays(
     points: np.ndarray,
     colors: np.ndarray,
     num_bins: int,
+    world_size: float = 32.0,
 ) -> PreparedPointCloud:
     if points.shape[0] == 0:
         raise ValueError("Cannot prepare an empty point cloud.")
 
-    grid_size = Layout.get_grid_size(num_bins)
+    grid_size = Layout.get_grid_size(num_bins, world_size=world_size)
     min_extent = np.min(points, axis=0)
     input_tensor = preprocess_point_cloud(points, colors, grid_size, num_bins)
     return PreparedPointCloud(
@@ -196,11 +198,42 @@ def decode_generated_layout(
     text: str,
     min_extent: np.ndarray,
     num_bins: int,
+    world_size: float = 32.0,
 ) -> Layout:
     layout = Layout(text)
-    layout.undiscretize_and_unnormalize(num_bins=num_bins)
+    layout.undiscretize_and_unnormalize(num_bins=num_bins, world_size=world_size)
     layout.translate(min_extent)
     return layout
+
+
+def model_world_size(model) -> float:
+    return float(model.config.point_config.get("world_size", 32.0))
+
+
+def center_crop_point_arrays(
+    points: np.ndarray,
+    colors: np.ndarray,
+    world_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    min_bound = points.min(axis=0)
+    max_bound = points.max(axis=0)
+    extent = max_bound - min_bound
+    if world_size >= 32.0 or np.all(extent <= world_size):
+        return points, colors
+
+    crop_center = (min_bound + max_bound) * 0.5
+    crop_half_size = np.full(3, world_size * 0.5, dtype=np.float64)
+    crop_min_bound = crop_center - crop_half_size
+    crop_max_bound = crop_center + crop_half_size
+    crop_mask = np.all(
+        (points >= crop_min_bound) & (points <= crop_max_bound),
+        axis=1,
+    )
+    if not np.any(crop_mask):
+        nearest_index = int(np.argmin(np.sum((points - crop_center) ** 2, axis=1)))
+        crop_mask[nearest_index] = True
+
+    return points[crop_mask], colors[crop_mask]
 
 
 def points_in_region(points: np.ndarray, region: Region) -> np.ndarray:
@@ -257,6 +290,13 @@ def final_layout_from_parts(stage1_layout: Layout, bboxes: list[Bbox]) -> Layout
     return final_layout
 
 
+def load_gt_region_layout(scene_id: str, gt_region_dir: Path) -> Layout:
+    region_path = gt_region_dir / f"{scene_id}.txt"
+    if not region_path.exists():
+        raise FileNotFoundError(f"GT region file not found: {region_path}")
+    return Layout(region_path.read_text(encoding="utf-8"))
+
+
 def predict_hierarchical_scene(
     scene: SceneInput,
     stage1_model,
@@ -265,28 +305,44 @@ def predict_hierarchical_scene(
     stage2_tokenizer,
     args: argparse.Namespace,
 ) -> HierarchicalPrediction:
-    stage1_prompt = prompt_with_point_token(STAGE1_PROMPT)
     stage2_prompt = prompt_with_point_token(STAGE2_PROMPT)
-    num_bins_stage1 = stage1_model.config.point_config["num_bins"]
     num_bins_stage2 = stage2_model.config.point_config["num_bins"]
+    world_size_stage2 = model_world_size(stage2_model)
 
+    gt_region_dir = getattr(args, "gt_region_dir", None)
+    world_size_stage1 = (
+        world_size_stage2
+        if gt_region_dir is not None
+        else model_world_size(stage1_model)
+    )
+    num_bins_scene = (
+        num_bins_stage2
+        if gt_region_dir is not None
+        else stage1_model.config.point_config["num_bins"]
+    )
     scene_pcd = prepare_scene_point_cloud(
         scene.pcd_path,
-        num_bins_stage1,
+        num_bins_scene,
         args.no_cleanup,
+        world_size=world_size_stage1,
     )
-    stage1_generated = generate_layout_text(
-        stage1_model,
-        stage1_tokenizer,
-        stage1_prompt,
-        scene_pcd.input_tensor,
-        args,
-    )
-    stage1_layout = decode_generated_layout(
-        stage1_generated,
-        scene_pcd.min_extent,
-        num_bins_stage1,
-    )
+    if gt_region_dir is not None:
+        stage1_layout = load_gt_region_layout(scene.scene_id, gt_region_dir)
+    else:
+        stage1_prompt = prompt_with_point_token(STAGE1_PROMPT)
+        stage1_generated = generate_layout_text(
+            stage1_model,
+            stage1_tokenizer,
+            stage1_prompt,
+            scene_pcd.input_tensor,
+            args,
+        )
+        stage1_layout = decode_generated_layout(
+            stage1_generated,
+            scene_pcd.min_extent,
+            num_bins_scene,
+            world_size=world_size_stage1,
+        )
 
     region_predictions: list[RegionPrediction] = []
     all_bboxes: list[Bbox] = []
@@ -310,7 +366,33 @@ def predict_hierarchical_scene(
             )
             continue
 
-        region_pcd = prepare_point_arrays(region_points, region_colors, num_bins_stage2)
+        region_points, region_colors = center_crop_point_arrays(
+            region_points,
+            region_colors,
+            world_size_stage2,
+        )
+
+        if region_points.shape[0] < args.min_region_points:
+            region_predictions.append(
+                RegionPrediction(
+                    index=region_index,
+                    region=region,
+                    point_count=int(region_points.shape[0]),
+                    bboxes=[],
+                    skipped=True,
+                    skip_reason="too_few_points_after_center_crop",
+                    points=region_points,
+                    colors=region_colors,
+                )
+            )
+            continue
+
+        region_pcd = prepare_point_arrays(
+            region_points,
+            region_colors,
+            num_bins_stage2,
+            world_size=world_size_stage2,
+        )
         stage2_generated = generate_layout_text(
             stage2_model,
             stage2_tokenizer,
@@ -322,6 +404,7 @@ def predict_hierarchical_scene(
             stage2_generated,
             region_pcd.min_extent,
             num_bins_stage2,
+            world_size=world_size_stage2,
         )
         all_bboxes.extend(region_layout.bboxes)
         region_predictions.append(
@@ -480,6 +563,15 @@ def parse_args() -> argparse.Namespace:
         "--stage2_model_path",
         default="saves/hierarchical/stage2_bboxes",
     )
+    parser.add_argument(
+        "--gt_region_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Use per-scene GT Region txt files from this directory instead of "
+            "loading/running the stage-1 model. This isolates stage-2 bbox inference."
+        ),
+    )
     parser.add_argument("--inference_dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--top_k", type=int, default=10)
@@ -570,11 +662,17 @@ def main() -> int:
     if not scenes:
         raise ValueError("No scenes found for inference.")
 
-    stage1_model, stage1_tokenizer = load_model_and_tokenizer(
-        args.stage1_model_path,
-        args.inference_dtype,
-        args.device,
-    )
+    stage1_model = None
+    stage1_tokenizer = None
+    if args.gt_region_dir is None:
+        stage1_model, stage1_tokenizer = load_model_and_tokenizer(
+            args.stage1_model_path,
+            args.inference_dtype,
+            args.device,
+        )
+    elif not args.gt_region_dir.is_dir():
+        raise NotADirectoryError(f"GT region directory not found: {args.gt_region_dir}")
+
     stage2_model, stage2_tokenizer = load_model_and_tokenizer(
         args.stage2_model_path,
         args.inference_dtype,

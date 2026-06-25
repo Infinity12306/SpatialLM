@@ -119,6 +119,26 @@ class DataArguments:
         default=1280,
         metadata={"help": "The number of bins for point cloud quantization."},
     )
+    world_size: float = field(
+        default=32.0,
+        metadata={
+            "help": (
+                "World extent in meters used for point cloud quantization and "
+                "layout position discretization. Region point clouds larger than "
+                "this extent on any axis are center-cropped before encoding."
+            )
+        },
+    )
+    max_point_tokens: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum number of encoded point tokens inserted into the "
+                "language model. Longer point-token sequences are center-cropped "
+                "by removing tokens from both ends."
+            )
+        },
+    )
     do_augmentation: bool = field(
         default=False,
         metadata={"help": "Whether or not to do data augmentation."},
@@ -145,6 +165,10 @@ class DataArguments:
 
         if self.eval_dataset is not None and self.val_size > 1e-6:
             raise ValueError("Cannot specify `val_size` if `eval_dataset` is not None.")
+        if self.world_size <= 0:
+            raise ValueError("`world_size` must be positive.")
+        if self.max_point_tokens is not None and self.max_point_tokens <= 0:
+            raise ValueError("`max_point_tokens` must be positive when configured.")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

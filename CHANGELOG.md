@@ -1,5 +1,23 @@
 # Changelog
 
+## 46e64d02417fb6e0c0da0b8e78819c62f88fa12c
+- Summary: Add prediction diagnostics and flexible hierarchical workflow controls.
+- Author: Codex <codex@openai.com>
+- Date: 2026-06-07 11:48:38 +0800
+- Details: Add prediction overlap and region-scale analyzers plus standalone class-wise bbox NMS post-processing.
+- Details: Extend worst-prediction ranking with region scoring and full CSV export, and make scene render gathering optional and path-flexible.
+- Details: Add stage-2-only training, checkpoint resume validation, per-stage step overrides, updated ignore rules, and the prior commit changelog.
+
+### Files
+- `.gitignore`: Ignores generated YAML configs and local run scripts while retaining the main checked-in training configs.
+- `CHANGELOG.md`: Adds repository commit metadata and per-file change summaries for the hierarchical tooling commit.
+- `analyze_prediction_overlaps.py`: New utility that measures pairwise predicted bbox overlaps, writes per-scene and ranked CSV reports, and generates same-class IoU histograms.
+- `analyze_region_scale_histograms.py`: New utility that analyzes expanded region dimensions and exports scale statistics, CSV data, and histogram plots.
+- `apply_bbox_nms.py`: New utility that applies order-based, class-wise 3D bbox NMS to flat or hierarchical prediction directories.
+- `filter_worst_predictions.py`: Adds region prediction scoring, derived or explicit GT region support, reusable entity matching, and full ranked CSV export.
+- `gather_scene.py`: Makes render artifacts optional, supports multiple render directory layouts, and replaces existing copied outputs consistently.
+- `train_hierarchical_spatiallm.py`: Adds stage-2-only execution, stage-1 checkpoint resume validation, config alias normalization, model overrides, and per-stage save/eval step controls.
+
 ## f6b175e03d03336108ae837afe82de094dde3f66
 - Summary: Add hierarchical region training and inference tooling.
 - Author: Codex <codex@openai.com>
