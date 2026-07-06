@@ -14,11 +14,11 @@ POST_LAUNCH_WAIT_SEC=600  # 10 minutes
 OOM_KEYWORD="Error"
 
 COMMANDS=(
-    "python train_hierarchical_spatiallm.py configs/spatiallm_hierarchical_20000_res_16.yaml"
+    "bash /data2/chenjq24/SpatialLM/run_point_token_scorer_context_bf16.sh"
 )
 
 LOG_FILES=(
-    "logs/two_stage/exp03_20000_res_16.log"
+    ""
 )
 
 commands_from_args=false
@@ -108,27 +108,49 @@ while (( next_cmd_idx < ${#COMMANDS[@]} )); do
         if [ "$used_mem_mb" -lt "$MEMORY_THRESHOLD_MB" ]; then
             cmd="${COMMANDS[$next_cmd_idx]}"
             log_file="${LOG_FILES[$next_cmd_idx]}"
-            launch_cmd="${cmd} > \"${log_file}\" 2>&1 &"
 
-            mkdir -p "$(dirname "$log_file")"
+            if [[ -n "$log_file" ]]; then
+                launch_cmd="${cmd} > \"${log_file}\" 2>&1 &"
+                mkdir -p "$(dirname "$log_file")"
+            else
+                launch_cmd="${cmd} &"
+            fi
 
             echo ""
             echo "=========================================="
             echo "GPU ${gpu_id} is available! (using ${used_mem_mb} MB)"
             echo "Launching command index ${next_cmd_idx}:"
             echo "  ${cmd}"
-            echo "Log file:"
-            echo "  ${log_file}"
+            if [[ -n "$log_file" ]]; then
+                echo "Log file:"
+                echo "  ${log_file}"
+            else
+                echo "Log file:"
+                echo "  <none; command stdout/stderr are not redirected by this script>"
+            fi
             echo "=========================================="
             echo ""
 
             CUDA_VISIBLE_DEVICES="$gpu_id" nohup bash -c "$launch_cmd"
             launched_this_round=true
 
-            echo "Waiting ${POST_LAUNCH_WAIT_SEC} seconds before checking ${log_file}..."
+            if [[ -n "$log_file" ]]; then
+                echo "Waiting ${POST_LAUNCH_WAIT_SEC} seconds before checking ${log_file}..."
+            else
+                echo "Waiting ${POST_LAUNCH_WAIT_SEC} seconds; no log file was configured for OOM checking..."
+            fi
             sleep "$POST_LAUNCH_WAIT_SEC"
 
-            if [[ -f "$log_file" ]] && grep -q "$OOM_KEYWORD" "$log_file"; then
+            if [[ -z "$log_file" ]]; then
+                echo "No log file configured, skipping '${OOM_KEYWORD}' check."
+                echo "Command index ${next_cmd_idx} is accepted; moving to the next command."
+                next_cmd_idx=$((next_cmd_idx + 1))
+
+                if (( next_cmd_idx >= ${#COMMANDS[@]} )); then
+                    echo "All commands have been dispatched."
+                    exit 0
+                fi
+            elif [[ -f "$log_file" ]] && grep -q "$OOM_KEYWORD" "$log_file"; then
                 echo "Detected '${OOM_KEYWORD}' in ${log_file}."
                 echo "Command index ${next_cmd_idx} likely launched on an already occupied GPU."
                 echo "Will retry the same command after polling for free GPUs again."

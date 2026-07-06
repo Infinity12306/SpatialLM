@@ -77,6 +77,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 enc_mode=point_config["enc_mode"],
                 enable_fourier_encode=True,
                 num_bins=point_config["num_bins"],
+                world_size=point_config.get("world_size", 32.0),
             )
             embed_channels = point_config["enc_channels"][-1]
         else:
@@ -101,7 +102,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def forward_point_cloud(self, point_cloud, device, dtype):
+    def forward_point_cloud(self, point_cloud, device, dtype, point_token_keep_bboxes=None):
         # point cloud has shape (n_points, n_features)
         # find the points that have nan values
         self.point_backbone.to(torch.float32)
@@ -126,6 +127,8 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 "feat": feats.to(device),
                 "batch": torch.zeros(coords.shape[0], dtype=torch.long).to(device),
             }
+            if point_token_keep_bboxes is not None:
+                input_dict["point_token_keep_bboxes"] = point_token_keep_bboxes.to(device)
             encoded_features = self.point_backbone(input_dict)
             encoded_features = center_crop_point_tokens(
                 encoded_features,
@@ -159,6 +162,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
         point_clouds: Optional[torch.Tensor] = None,
+        point_token_keep_bboxes: Optional[torch.Tensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -221,8 +225,16 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
             point_features = []
             for i in range(n_point_clouds):  # * iterate over batch
                 point_cloud = point_clouds[i]
+                cur_point_token_keep_bboxes = (
+                    point_token_keep_bboxes[i]
+                    if point_token_keep_bboxes is not None
+                    else None
+                )
                 point_feature = self.forward_point_cloud(
-                    point_cloud, inputs_embeds.device, inputs_embeds.dtype
+                    point_cloud,
+                    inputs_embeds.device,
+                    inputs_embeds.dtype,
+                    cur_point_token_keep_bboxes,
                 )
                 point_features.append(point_feature)
 
@@ -399,6 +411,10 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "point_clouds": kwargs.get("point_clouds", None),
+                "point_token_keep_bboxes": kwargs.get(
+                    "point_token_keep_bboxes",
+                    None,
+                ),
             }
         )
         return model_inputs

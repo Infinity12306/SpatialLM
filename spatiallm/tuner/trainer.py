@@ -113,6 +113,8 @@ def run_sft(
         world_size=data_args.world_size,
         do_augmentation=data_args.do_augmentation,
         random_rotation=data_args.random_rotation,
+        point_token_bbox_mask=data_args.point_token_bbox_mask,
+        point_token_bbox_expand_ratio=data_args.point_token_bbox_expand_ratio,
     )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

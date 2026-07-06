@@ -318,6 +318,8 @@ def register_spatiallm_templates(
     world_size: float = 32.0,
     do_augmentation: bool = False,
     random_rotation: bool = False,
+    point_token_bbox_mask: bool = False,
+    point_token_bbox_expand_ratio: float = 0.1,
 ):
     register_template(
         name="spatiallm_llama",
@@ -342,6 +344,8 @@ def register_spatiallm_templates(
             world_size=world_size,
             do_augmentation=do_augmentation,
             random_rotation=random_rotation,
+            point_token_bbox_mask=point_token_bbox_mask,
+            point_token_bbox_expand_ratio=point_token_bbox_expand_ratio,
         ),
         cutoff_len=cutoff_len,
     )
@@ -363,6 +367,8 @@ def register_spatiallm_templates(
             world_size=world_size,
             do_augmentation=do_augmentation,
             random_rotation=random_rotation,
+            point_token_bbox_mask=point_token_bbox_mask,
+            point_token_bbox_expand_ratio=point_token_bbox_expand_ratio,
         ),
         cutoff_len=cutoff_len,
     )

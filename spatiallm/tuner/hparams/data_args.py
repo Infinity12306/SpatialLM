@@ -139,6 +139,25 @@ class DataArguments:
             )
         },
     )
+    point_token_bbox_mask: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to keep only final point tokens whose voxels overlap "
+                "GT object bboxes. This is intended for hierarchical stage-2 "
+                "experiments."
+            )
+        },
+    )
+    point_token_bbox_expand_ratio: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Per-side expansion ratio for GT object bboxes used by "
+                "point-token masking. 0.1 makes each dimension 1.2x."
+            )
+        },
+    )
     do_augmentation: bool = field(
         default=False,
         metadata={"help": "Whether or not to do data augmentation."},
@@ -169,6 +188,8 @@ class DataArguments:
             raise ValueError("`world_size` must be positive.")
         if self.max_point_tokens is not None and self.max_point_tokens <= 0:
             raise ValueError("`max_point_tokens` must be positive when configured.")
+        if self.point_token_bbox_expand_ratio < 0:
+            raise ValueError("`point_token_bbox_expand_ratio` must be non-negative.")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -803,6 +803,83 @@ def fourier_encode_vector(vec, num_bands=10, sample_rate=60):
     return encoding.flatten(1)
 
 
+def point_token_bbox_overlap_mask(
+    grid_coord: torch.Tensor,
+    keep_bboxes: torch.Tensor,
+    voxel_size: float,
+) -> torch.Tensor:
+    """Return final-token keep mask from active voxel coords and yaw-only boxes."""
+    if grid_coord.numel() == 0:
+        return torch.zeros(
+            grid_coord.shape[0],
+            dtype=torch.bool,
+            device=grid_coord.device,
+        )
+    if keep_bboxes is None or keep_bboxes.numel() == 0:
+        return torch.ones(
+            grid_coord.shape[0],
+            dtype=torch.bool,
+            device=grid_coord.device,
+        )
+
+    keep_bboxes = keep_bboxes.to(device=grid_coord.device, dtype=torch.float32)
+    valid = torch.isfinite(keep_bboxes).all(dim=-1)
+    keep_bboxes = keep_bboxes[valid]
+    if keep_bboxes.shape[0] == 0:
+        return torch.ones(
+            grid_coord.shape[0],
+            dtype=torch.bool,
+            device=grid_coord.device,
+        )
+
+    box_center = keep_bboxes[:, 0:3]
+    box_size = keep_bboxes[:, 3:6].abs()
+    box_angle_z = keep_bboxes[:, 6]
+
+    half_voxel = float(voxel_size) * 0.5
+    box_half = box_size * 0.5
+    cos = torch.cos(box_angle_z)
+    sin = torch.sin(box_angle_z)
+    box_axis_x = torch.stack([cos, sin], dim=-1)
+    box_axis_y = torch.stack([-sin, cos], dim=-1)
+
+    hx = box_half[:, 0]
+    hy = box_half[:, 1]
+    hz = box_half[:, 2]
+    voxel_center = (grid_coord.to(torch.float32) + 0.5) * float(voxel_size)
+    delta = voxel_center[:, None, :] - box_center[None, :, :]
+    delta_xy = delta[..., :2]
+
+    z_overlap = delta[..., 2].abs() <= (half_voxel + hz)[None, :]
+
+    box_radius_world_x = hx * box_axis_x[:, 0].abs() + hy * box_axis_y[:, 0].abs()
+    box_radius_world_y = hx * box_axis_x[:, 1].abs() + hy * box_axis_y[:, 1].abs()
+    overlap_world_x = delta[..., 0].abs() <= (half_voxel + box_radius_world_x)[None, :]
+    overlap_world_y = delta[..., 1].abs() <= (half_voxel + box_radius_world_y)[None, :]
+
+    delta_on_box_x = (delta_xy * box_axis_x[None, :, :]).sum(dim=-1)
+    delta_on_box_y = (delta_xy * box_axis_y[None, :, :]).sum(dim=-1)
+    voxel_radius_on_box_x = half_voxel * (
+        box_axis_x[:, 0].abs() + box_axis_x[:, 1].abs()
+    )
+    voxel_radius_on_box_y = half_voxel * (
+        box_axis_y[:, 0].abs() + box_axis_y[:, 1].abs()
+    )
+    overlap_box_x = delta_on_box_x.abs() <= (hx + voxel_radius_on_box_x)[None, :]
+    overlap_box_y = delta_on_box_y.abs() <= (hy + voxel_radius_on_box_y)[None, :]
+
+    keep_mask = (
+        z_overlap
+        & overlap_world_x
+        & overlap_world_y
+        & overlap_box_x
+        & overlap_box_y
+    ).any(dim=1)
+    if not torch.any(keep_mask):
+        return torch.ones_like(keep_mask)
+    return keep_mask
+
+
 class Sonata(PointModule, PyTorchModelHubMixin):
     def __init__(
         self,
@@ -830,6 +907,7 @@ class Sonata(PointModule, PyTorchModelHubMixin):
         enc_mode=True,
         enable_fourier_encode=False,
         num_bins=1280,
+        world_size=32.0,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -910,6 +988,7 @@ class Sonata(PointModule, PyTorchModelHubMixin):
         downconvs = len(enc_channels) - 1
         res_reduction = 2**downconvs  # voxel resolution reduction
         self.reduced_grid_size = int(num_bins / res_reduction)
+        self.final_voxel_size = float(world_size) / float(self.reduced_grid_size)
         self.input_proj = (
             nn.Linear(enc_channels[-1] + 63, enc_channels[-1])
             if self.enable_fourier_encode
@@ -925,6 +1004,15 @@ class Sonata(PointModule, PyTorchModelHubMixin):
 
         point = self.enc(point)
         context = point["sparse_conv_feat"].features
+        keep_bboxes = data_dict.get("point_token_keep_bboxes")
+        if keep_bboxes is not None:
+            keep_mask = point_token_bbox_overlap_mask(
+                point["grid_coord"],
+                keep_bboxes,
+                self.final_voxel_size,
+            )
+            point["grid_coord"] = point["grid_coord"][keep_mask]
+            context = context[keep_mask]
 
         if self.enable_fourier_encode:
             coords = point["grid_coord"]
@@ -934,4 +1022,6 @@ class Sonata(PointModule, PyTorchModelHubMixin):
             context = torch.cat([context, encoded_coords], dim=-1)
             context = self.input_proj(context)
 
+        if data_dict.get("return_grid_coord", False):
+            return {"context": context, "grid_coord": point["grid_coord"]}
         return context

@@ -191,3 +191,7 @@ run.sh
 run*.sh
 analyze_*.py
 nohup.out
+
+proposal/
+reports/
+.vscode/

@@ -32,8 +32,12 @@ class SpatialLMPlugin:
         world_size: float = 32.0,
         do_augmentation: bool = False,
         random_rotation: bool = False,
+        point_token_bbox_mask: bool = False,
+        point_token_bbox_expand_ratio: float = 0.1,
     ):
         self.point_token = point_token
+        self.point_token_bbox_mask = point_token_bbox_mask
+        self.point_token_bbox_expand_ratio = point_token_bbox_expand_ratio
 
         default_world_extent = get_world_preset()
         global_extent = get_world_preset(world_size)
@@ -150,6 +154,42 @@ class SpatialLMPlugin:
         # convert list of point clouds to batch with shape (batch_size, max_len, 3)
         return torch.as_tensor(np.stack(points_list, axis=0))
 
+    def _regularize_point_token_keep_bboxes(
+        self,
+        point_token_keep_bboxes: Sequence[np.ndarray],
+    ) -> torch.Tensor:
+        batch_size = len(point_token_keep_bboxes)
+        max_boxes = max((bboxes.shape[0] for bboxes in point_token_keep_bboxes), default=0)
+        if max_boxes == 0:
+            return torch.empty((batch_size, 0, 7), dtype=torch.float32)
+
+        batched = np.full((batch_size, max_boxes, 7), np.nan, dtype=np.float32)
+        for index, bboxes in enumerate(point_token_keep_bboxes):
+            if bboxes.size == 0:
+                continue
+            batched[index, : bboxes.shape[0], :] = bboxes.astype(np.float32)
+        return torch.as_tensor(batched)
+
+    def _bboxes_to_point_token_keep_array(self, layout: Layout) -> np.ndarray:
+        if not layout.bboxes:
+            return np.empty((0, 7), dtype=np.float32)
+
+        scale_multiplier = 1.0 + 2.0 * self.point_token_bbox_expand_ratio
+        values = []
+        for bbox in layout.bboxes:
+            values.append(
+                [
+                    bbox.position_x,
+                    bbox.position_y,
+                    bbox.position_z,
+                    bbox.scale_x * scale_multiplier,
+                    bbox.scale_y * scale_multiplier,
+                    bbox.scale_z * scale_multiplier,
+                    bbox.angle_z,
+                ]
+            )
+        return np.asarray(values, dtype=np.float32)
+
     def _get_mm_inputs(
         self,
         batched_messages: Sequence[Dict[str, str]],
@@ -204,10 +244,15 @@ class SpatialLMPlugin:
         # Here we assume each conversation has exactly one point cloud
         assert len(batched_messages) == len(point_clouds_data)
         processed_messages = []
+        point_token_keep_bboxes = []
         for mi, messages in enumerate(batched_messages):
-            processed_messages.append(
-                self.process_messages(messages, [transformations[mi]])
+            processed, keep_bboxes = self.process_messages(
+                messages,
+                [transformations[mi]],
+                return_point_token_keep_bboxes=True,
             )
+            processed_messages.append(processed)
+            point_token_keep_bboxes.append(keep_bboxes)
 
         if len(processed_messages) != 0:
             input_dict["messages"] = processed_messages
@@ -215,6 +260,10 @@ class SpatialLMPlugin:
             # convert point clouds to batched tensors with shape (batch_size, max_len, 9)
             input_dict["point_clouds"] = self._regularize_point_clouds(
                 point_clouds_data
+            )
+        if self.point_token_bbox_mask:
+            input_dict["point_token_keep_bboxes"] = self._regularize_point_token_keep_bboxes(
+                point_token_keep_bboxes
             )
         return input_dict
 
@@ -244,13 +293,15 @@ class SpatialLMPlugin:
         self,
         messages: Sequence[Dict[str, str]],
         transformations: Sequence[dict],
-    ) -> List[Dict[str, str]]:
+        return_point_token_keep_bboxes: bool = False,
+    ) -> Union[List[Dict[str, str]], Tuple[List[Dict[str, str]], np.ndarray]]:
         r"""
         Pre-processes input messages to sync the transformation between point cloud and layout.
         """
         self._validate_input(transformations)
         messages = deepcopy(messages)
         num_point_tokens = 0
+        point_token_keep_bboxes = np.empty((0, 7), dtype=np.float32)
 
         for message in messages:
             content = message["content"]
@@ -287,6 +338,8 @@ class SpatialLMPlugin:
                 layout.filter_empty_bboxes(transformed_points, num_points=100)
                 layout.reorder_entities()
                 layout.translate(-min_bound)
+                if self.point_token_bbox_mask:
+                    point_token_keep_bboxes = self._bboxes_to_point_token_keep_array(layout)
                 layout.normalize_and_discretize(
                     self.num_bins,
                     world_size=self.world_size,
@@ -311,6 +364,8 @@ class SpatialLMPlugin:
             raise ValueError(
                 f"The number of point clouds does not match the number of {POINT_CLOUD_PLACEHOLDER} tokens."
             )
+        if return_point_token_keep_bboxes:
+            return messages, point_token_keep_bboxes
         return messages
 
     def get_mm_inputs(
