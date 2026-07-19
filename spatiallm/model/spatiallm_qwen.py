@@ -163,6 +163,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         num_logits_to_keep: int = 0,
         point_clouds: Optional[torch.Tensor] = None,
         point_token_keep_bboxes: Optional[torch.Tensor] = None,
+        point_token_features: Optional[torch.Tensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -216,30 +217,44 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
 
+        point_start_end_token_pos = []
+        has_point_inputs = point_clouds is not None or point_token_features is not None
         if (
             self.point_backbone is not None
             and (input_ids.shape[1] != 1 or self.training)
-            and point_clouds is not None
+            and has_point_inputs
         ):
-            n_point_clouds = point_clouds.shape[0]
             point_features = []
-            for i in range(n_point_clouds):  # * iterate over batch
-                point_cloud = point_clouds[i]
-                cur_point_token_keep_bboxes = (
-                    point_token_keep_bboxes[i]
-                    if point_token_keep_bboxes is not None
-                    else None
-                )
-                point_feature = self.forward_point_cloud(
-                    point_cloud,
-                    inputs_embeds.device,
-                    inputs_embeds.dtype,
-                    cur_point_token_keep_bboxes,
-                )
-                point_features.append(point_feature)
+            if point_token_features is not None:
+                n_point_clouds = point_token_features.shape[0]
+                for i in range(n_point_clouds):  # * iterate over batch
+                    cur_point_features = point_token_features[i]
+                    valid_mask = ~torch.isnan(cur_point_features).any(dim=-1)
+                    cur_point_features = cur_point_features[valid_mask]
+                    point_features.append(
+                        cur_point_features.to(
+                            device=inputs_embeds.device,
+                            dtype=inputs_embeds.dtype,
+                        ).unsqueeze(0)
+                    )
+            else:
+                n_point_clouds = point_clouds.shape[0]
+                for i in range(n_point_clouds):  # * iterate over batch
+                    point_cloud = point_clouds[i]
+                    cur_point_token_keep_bboxes = (
+                        point_token_keep_bboxes[i]
+                        if point_token_keep_bboxes is not None
+                        else None
+                    )
+                    point_feature = self.forward_point_cloud(
+                        point_cloud,
+                        inputs_embeds.device,
+                        inputs_embeds.dtype,
+                        cur_point_token_keep_bboxes,
+                    )
+                    point_features.append(point_feature)
 
             # Insert point cloud features into the input ids
-            point_start_end_token_pos = []
             new_input_embeds = []
             new_attention_mask = []
             cur_point_idx = 0
@@ -336,34 +351,35 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         loss = None
         if labels is not None:
             # prepare new labels
-            new_labels = []
             max_num_tokens = logits.shape[1]
-            for i in range(len(point_start_end_token_pos)):
-                cur_labels = labels[i]
-                (
-                    cur_point_start_token_pos,
-                    num_patches,
-                    cur_point_end_token_pos,
-                ) = point_start_end_token_pos[i]
-                cur_new_labels = torch.cat(
+            if point_start_end_token_pos:
+                new_labels = []
+                for i in range(len(point_start_end_token_pos)):
+                    cur_labels = labels[i]
                     (
-                        cur_labels[: cur_point_start_token_pos + 1],
-                        torch.full(
-                            (num_patches,),
-                            IGNORE_INDEX,
-                            device=cur_labels.device,
+                        cur_point_start_token_pos,
+                        num_patches,
+                        cur_point_end_token_pos,
+                    ) = point_start_end_token_pos[i]
+                    cur_new_labels = torch.cat(
+                        (
+                            cur_labels[: cur_point_start_token_pos + 1],
+                            torch.full(
+                                (num_patches,),
+                                IGNORE_INDEX,
+                                device=cur_labels.device,
+                            ),
+                            cur_labels[cur_point_end_token_pos:],
                         ),
-                        cur_labels[cur_point_end_token_pos:],
-                    ),
-                    dim=0,
-                )
-                cur_new_labels = F.pad(
-                    cur_new_labels,
-                    (0, max_num_tokens - cur_new_labels.shape[0]),
-                    value=IGNORE_INDEX,
-                )
-                new_labels.append(cur_new_labels)
-            labels = torch.stack(new_labels, dim=0)
+                        dim=0,
+                    )
+                    cur_new_labels = F.pad(
+                        cur_new_labels,
+                        (0, max_num_tokens - cur_new_labels.shape[0]),
+                        value=IGNORE_INDEX,
+                    )
+                    new_labels.append(cur_new_labels)
+                labels = torch.stack(new_labels, dim=0)
 
             assert (
                 labels.shape[1] == logits.shape[1]
@@ -415,6 +431,7 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                     "point_token_keep_bboxes",
                     None,
                 ),
+                "point_token_features": kwargs.get("point_token_features", None),
             }
         )
         return model_inputs

@@ -179,10 +179,11 @@ spatiallm-dataset/
 spatiallm-testset/
 grouding-dino/
 wandb/
+logs/
 spatiallm-dataset-link
 
 ours/scripts/
-configs/*.yaml
+configs/
 !/data2/chenjq24/SpatialLM/configs/spatiallm_hierarchical_20000.yaml
 !/data2/chenjq24/SpatialLM/configs/spatiallm_sft.yaml
 
@@ -195,3 +196,5 @@ nohup.out
 proposal/
 reports/
 .vscode/
+data/
+run_scripts/

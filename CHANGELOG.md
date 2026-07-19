@@ -1,5 +1,38 @@
 # 更新日志
 
+## 02c6f623920e0b3f2b90ebef99e929214794a68c
+- 摘要：Add point-token bbox masking, evict workflows, and scorer tooling
+- 作者：Codex <codex@openai.com>
+- 日期：2026-07-06 16:43:52 +0800
+- 详情：为 Sonata 点编码器添加基于 bbox 重叠的点 token 过滤，并将 keep bbox 参数贯穿 Llama/Qwen 生成流程。
+- 详情：为第 2 阶段训练添加 GT bbox 点 token mask 的数据参数、模板注册和多模态插件接线。
+- 详情：添加 evict 数据集构建、oracle/预测区域推理变体，以及点 token scorer 的缓存预计算、训练、压力测试和推理工具。
+- 详情：翻译并扩展更新日志，更新本地忽略规则、AGENTS 指南和 GPU 启动脚本默认配置。
+
+### 文件
+- `.gitignore`：添加 `proposal/`、`reports/` 和 `.vscode/` 本地产物忽略规则。
+- `AGENTS.md`：新增仓库协作说明，声明主要使用中文交流并保留必要英文术语。
+- `CHANGELOG.md`：将既有更新日志翻译为中文，并保留上一条世界尺寸点 token 控制提交的记录。
+- `build_stage2_evict_dataset.py`：新增第 2 阶段 evict 数据集构建脚本，用 GT 对象和布局框筛选区域点云并写出 `_evict` 数据集与统计信息。
+- `inference_hierarchical_bbox_mask.py`：新增 oracle 第 2 阶段推理入口，默认启用 GT bbox 点 token mask。
+- `inference_hierarchical_evict.py`：新增基于预过滤区域 PCD 的 oracle 第 2 阶段分层推理脚本，并支持可选 GT bbox mask。
+- `inference_hierarchical_gt_region.py`：新增直接在 GT-region 点云 JSON 上执行第 2 阶段推理的入口。
+- `inference_hierarchical_pred_region_bbox_mask.py`：新增预测区域分层推理入口，默认关闭点云 evict 并启用 GT bbox 点 token mask。
+- `inference_hierarchical_pred_region_evict.py`：新增预测区域推理脚本，支持按 GT 辅助筛选区域点、GT bbox token mask、NMS、分片和错误续跑。
+- `inference_hierarchical_scorer.py`：新增 scorer 驱动的分层推理脚本，用训练好的点 token scorer 选择第 2 阶段 token。
+- `precompute_point_token_scorer_data.py`：新增 scorer 数据预计算脚本，缓存点编码器 context 特征、grid 坐标和 GT bbox mask 标签。
+- `spatiallm/model/sonata_encoder.py`：添加点 token 与旋转 bbox 的重叠 mask 计算，支持按 bbox 保留 token，并可返回编码后的 grid 坐标。
+- `spatiallm/model/spatiallm_llama.py`：将 world_size 传给 Sonata，并在前向和生成输入中透传 `point_token_keep_bboxes`。
+- `spatiallm/model/spatiallm_qwen.py`：将 world_size 传给 Sonata，并在前向和生成输入中透传 `point_token_keep_bboxes`。
+- `spatiallm/tuner/data/mm_plugin.py`：添加 GT bbox 点 token mask 开关、bbox 扩展比例、batched keep bbox 构造，以及训练数据预处理中的 keep bbox 输出。
+- `spatiallm/tuner/data/template.py`：在 SpatialLM Llama/Qwen 模板注册时传入 bbox mask 相关配置。
+- `spatiallm/tuner/hparams/data_args.py`：新增 `point_token_bbox_mask` 和 `point_token_bbox_expand_ratio` 数据参数，并校验扩展比例非负。
+- `spatiallm/tuner/trainer.py`：训练注册模板时传入 bbox mask 相关数据参数。
+- `stress_test_point_token_scorer_memory.py`：新增 scorer 显存压力测试脚本，用最长缓存样本重复执行训练和评估循环。
+- `train_hierarchical_spatiallm_mask.py`：新增分层训练编排脚本，强制第 2 阶段启用 GT bbox 点 token mask 并支持阶段级覆盖参数。
+- `train_point_token_scorer.py`：新增点 token scorer 训练脚本，包含 transformer scorer、缓存数据集、分 shard batch、评估、checkpoint 和 WandB 支持。
+- `wait_for_gpu_and_train.sh`：更新默认排队命令为 point-token scorer 训练脚本，并支持未配置日志文件时启动和跳过 OOM 日志检查。
+
 ## 8015cbe0000d60700a1ec847dc4b9a405ecba6a6
 - 摘要：添加世界尺寸点 token 控制和第 2 阶段诊断功能。
 - 作者：Codex <codex@openai.com>

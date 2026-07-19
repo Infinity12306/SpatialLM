@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import shutil
 import sys
 from dataclasses import asdict, dataclass
@@ -40,6 +41,17 @@ class CacheItemMeta:
     item_index: int
 
 
+@dataclass
+class MessageItemMeta:
+    epoch: int
+    sample_index: int
+    point_cloud_index: int
+    scene_id: str
+    point_cloud: str
+    shard: str
+    item_index: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -51,7 +63,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--model_path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument(
+        "--message_output_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output dir for processed message cache. When set, messages "
+            "are written with the same shard/item_index layout as the point-token "
+            "cache, avoiding a second pass over the PCD files."
+        ),
+    )
     parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument(
+        "--epoch_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional explicit global epoch indices to process. Seeds still use "
+            "these global epoch indices, so parallel workers do not duplicate "
+            "augmentation when they process different epochs."
+        ),
+    )
+    parser.add_argument(
+        "--num_epoch_shards",
+        type=int,
+        default=1,
+        help="Split the selected global epochs across this many workers.",
+    )
+    parser.add_argument(
+        "--epoch_shard_index",
+        type=int,
+        default=0,
+        help="Worker index for --num_epoch_shards.",
+    )
     parser.add_argument("--shard_size", type=int, default=1250)
     parser.add_argument("--world_size", type=float, default=16.0)
     parser.add_argument("--num_bins", type=int, default=1280)
@@ -85,6 +130,17 @@ def parse_args() -> argparse.Namespace:
 
     if args.num_epochs <= 0:
         parser.error("--num_epochs must be positive.")
+    if args.num_epoch_shards <= 0:
+        parser.error("--num_epoch_shards must be positive.")
+    if args.epoch_shard_index < 0 or args.epoch_shard_index >= args.num_epoch_shards:
+        parser.error("--epoch_shard_index must satisfy 0 <= index < num_epoch_shards.")
+    if args.epoch_indices is not None:
+        invalid_epochs = [epoch for epoch in args.epoch_indices if epoch < 0 or epoch >= args.num_epochs]
+        if invalid_epochs:
+            parser.error(
+                "--epoch_indices must be within [0, num_epochs); "
+                f"got invalid values {invalid_epochs}."
+            )
     if args.shard_size <= 0:
         parser.error("--shard_size must be positive.")
     if args.world_size <= 0:
@@ -94,6 +150,23 @@ def parse_args() -> argparse.Namespace:
     if args.bbox_expand_ratio < 0:
         parser.error("--bbox_expand_ratio must be non-negative.")
     return args
+
+
+def selected_epochs(args: argparse.Namespace) -> list[int]:
+    epochs = (
+        list(dict.fromkeys(args.epoch_indices))
+        if args.epoch_indices is not None
+        else list(range(args.num_epochs))
+    )
+    return [
+        epoch
+        for ordinal, epoch in enumerate(epochs)
+        if ordinal % args.num_epoch_shards == args.epoch_shard_index
+    ]
+
+
+def is_partial_epoch_run(args: argparse.Namespace) -> bool:
+    return args.num_epoch_shards > 1 or args.epoch_indices is not None
 
 
 def torch_dtype(name: str) -> torch.dtype | str:
@@ -145,6 +218,14 @@ def sample_seed(base_seed: int, epoch: int, sample_index: int, point_cloud_index
         [base_seed, epoch, sample_index, point_cloud_index]
     )
     return int(sequence.generate_state(1, dtype=np.uint32)[0])
+
+
+def seed_all(seed: int) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_samples(dataset_json: Path, max_samples: int | None) -> list[dict[str, Any]]:
@@ -314,24 +395,69 @@ def flush_shard(
     shard_index: int,
     items: list[dict[str, Any]],
     metadata: dict[str, Any],
+    overwrite: bool = False,
 ) -> str:
     epoch_dir = output_dir / f"epoch_{epoch:03d}"
     epoch_dir.mkdir(parents=True, exist_ok=True)
     shard_rel = Path(f"epoch_{epoch:03d}") / f"shard_{shard_index:05d}.pt"
     shard_path = output_dir / shard_rel
+    if shard_path.exists() and not overwrite:
+        raise FileExistsError(f"Shard exists: {shard_path}. Use --overwrite to replace it.")
     torch.save({"metadata": metadata, "items": items}, shard_path)
     return str(shard_rel)
 
 
+def flush_message_shard(
+    output_dir: Path,
+    epoch: int,
+    shard_index: int,
+    items: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    overwrite: bool = False,
+) -> str:
+    epoch_dir = output_dir / f"epoch_{epoch:03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    shard_rel = Path(f"epoch_{epoch:03d}") / f"shard_{shard_index:05d}.pt"
+    shard_path = output_dir / shard_rel
+    if shard_path.exists() and not overwrite:
+        raise FileExistsError(f"Message shard exists: {shard_path}. Use --overwrite to replace it.")
+    torch.save({"metadata": metadata, "items": items}, shard_path)
+    return str(shard_rel)
+
+
+def write_index(path: Path, index: dict[str, Any], overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Index exists: {path}. Use --overwrite to replace it.")
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2)
+
+
 def main() -> None:
     args = parse_args()
-    if args.output_dir.exists():
+    epochs_to_process = selected_epochs(args)
+    if not epochs_to_process:
+        raise ValueError(
+            "No epochs selected. Check --num_epochs, --epoch_indices, "
+            "--num_epoch_shards, and --epoch_shard_index."
+        )
+    partial_epoch_run = is_partial_epoch_run(args)
+
+    if args.output_dir.exists() and not partial_epoch_run:
         if not args.overwrite:
             raise FileExistsError(
                 f"Output directory exists: {args.output_dir}. Use --overwrite to replace it."
             )
         shutil.rmtree(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.message_output_dir is not None:
+        if args.message_output_dir.exists() and not partial_epoch_run:
+            if not args.overwrite:
+                raise FileExistsError(
+                    f"Message output directory exists: {args.message_output_dir}. "
+                    "Use --overwrite to replace it."
+                )
+            shutil.rmtree(args.message_output_dir)
+        args.message_output_dir.mkdir(parents=True, exist_ok=True)
 
     samples = load_samples(args.dataset_json, args.max_samples)
     model = load_spatiallm_model(args)
@@ -347,10 +473,12 @@ def main() -> None:
     )
 
     index_samples: list[CacheItemMeta] = []
+    message_index_samples: list[MessageItemMeta] = []
     total_tokens = 0
     total_positive = 0
     total_items = 0
     shard_items: list[dict[str, Any]] = []
+    message_shard_items: list[dict[str, Any]] = []
     shard_index = 0
     current_shard_rel = ""
 
@@ -362,9 +490,14 @@ def main() -> None:
         "dataset_root": str(args.dataset_root.resolve()),
         "model_path": str(args.model_path),
         "num_epochs": args.num_epochs,
+        "selected_epochs": epochs_to_process,
+        "num_epoch_shards": args.num_epoch_shards,
+        "epoch_shard_index": args.epoch_shard_index,
+        "partial_epoch_run": partial_epoch_run,
         "world_size": args.world_size,
         "num_bins": args.num_bins,
         "bbox_expand_ratio": args.bbox_expand_ratio,
+        "seed": args.seed,
         "random_rotation": args.random_rotation,
         "do_augmentation": args.do_augmentation,
         "storage_dtype": args.storage_dtype,
@@ -372,8 +505,22 @@ def main() -> None:
         "reduced_grid_size": int(model.point_backbone.reduced_grid_size),
         "final_voxel_size": float(model.point_backbone.final_voxel_size),
     }
+    message_metadata = {
+        "format": "point_token_cache_messages_v1",
+        "source_cache_dir": str(args.output_dir.resolve()),
+        "source_cache_format": metadata["format"],
+        "dataset_json": str(args.dataset_json.resolve()),
+        "dataset_root": str(args.dataset_root.resolve()),
+        "world_size": args.world_size,
+        "num_bins": args.num_bins,
+        "bbox_expand_ratio": args.bbox_expand_ratio,
+        "seed": args.seed,
+        "random_rotation": args.random_rotation,
+        "do_augmentation": args.do_augmentation,
+        "created_with_point_token_cache": True,
+    }
 
-    for epoch in range(args.num_epochs):
+    for epoch in epochs_to_process:
         iterator = tqdm(
             enumerate(samples),
             total=len(samples),
@@ -386,13 +533,12 @@ def main() -> None:
             messages = messages_from_sharegpt(sample)
 
             for point_cloud_index, point_cloud_text in enumerate(point_clouds):
-                np.random.seed(
-                    sample_seed(args.seed, epoch, sample_index, point_cloud_index)
-                )
+                seed_all(sample_seed(args.seed, epoch, sample_index, point_cloud_index))
                 pcd_path = resolve_path(str(point_cloud_text), args.dataset_root)
                 mm_inputs = plugin._get_mm_inputs([messages], [str(pcd_path)])
                 point_cloud = mm_inputs["point_clouds"][0]
                 keep_bboxes = mm_inputs["point_token_keep_bboxes"][0]
+                processed_messages = mm_inputs["messages"][0]
 
                 features, grid_coord, center, labels = encode_one_point_cloud(
                     model,
@@ -415,6 +561,15 @@ def main() -> None:
                     "point_cloud": str(point_cloud_text),
                 }
                 shard_items.append(item)
+                message_item = {
+                    "messages": processed_messages,
+                    "epoch": epoch,
+                    "sample_index": sample_index,
+                    "point_cloud_index": point_cloud_index,
+                    "scene_id": scene_id_from_path(str(point_cloud_text)),
+                    "point_cloud": str(point_cloud_text),
+                }
+                message_shard_items.append(message_item)
 
                 positive_count = int(labels.sum().item())
                 token_count = int(labels.numel())
@@ -429,6 +584,7 @@ def main() -> None:
                         shard_index,
                         shard_items,
                         metadata,
+                        args.overwrite,
                     )
                     for local_index, shard_item in enumerate(shard_items):
                         index_samples.append(
@@ -444,7 +600,29 @@ def main() -> None:
                                 item_index=local_index,
                             )
                         )
+                    if args.message_output_dir is not None:
+                        flush_message_shard(
+                            args.message_output_dir,
+                            epoch,
+                            shard_index,
+                            message_shard_items,
+                            message_metadata,
+                            args.overwrite,
+                        )
+                        for local_index, message_item in enumerate(message_shard_items):
+                            message_index_samples.append(
+                                MessageItemMeta(
+                                    epoch=epoch,
+                                    sample_index=int(message_item["sample_index"]),
+                                    point_cloud_index=int(message_item["point_cloud_index"]),
+                                    scene_id=str(message_item["scene_id"]),
+                                    point_cloud=str(message_item["point_cloud"]),
+                                    shard=current_shard_rel,
+                                    item_index=local_index,
+                                )
+                            )
                     shard_items = []
+                    message_shard_items = []
                     shard_index += 1
 
         if shard_items:
@@ -454,6 +632,7 @@ def main() -> None:
                 shard_index,
                 shard_items,
                 metadata,
+                args.overwrite,
             )
             for local_index, shard_item in enumerate(shard_items):
                 index_samples.append(
@@ -469,7 +648,29 @@ def main() -> None:
                         item_index=local_index,
                     )
                 )
+            if args.message_output_dir is not None:
+                flush_message_shard(
+                    args.message_output_dir,
+                    epoch,
+                    shard_index,
+                    message_shard_items,
+                    message_metadata,
+                    args.overwrite,
+                )
+                for local_index, message_item in enumerate(message_shard_items):
+                    message_index_samples.append(
+                        MessageItemMeta(
+                            epoch=epoch,
+                            sample_index=int(message_item["sample_index"]),
+                            point_cloud_index=int(message_item["point_cloud_index"]),
+                            scene_id=str(message_item["scene_id"]),
+                            point_cloud=str(message_item["point_cloud"]),
+                            shard=current_shard_rel,
+                            item_index=local_index,
+                        )
+                    )
             shard_items = []
+            message_shard_items = []
             shard_index += 1
 
     metadata["num_items"] = total_items
@@ -483,10 +684,25 @@ def main() -> None:
         "metadata": metadata,
         "samples": [asdict(item) for item in index_samples],
     }
-    with (args.output_dir / "index.json").open("w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
+    index_name = (
+        f"index_epoch_shard_{args.epoch_shard_index:05d}_of_{args.num_epoch_shards:05d}.json"
+        if partial_epoch_run
+        else "index.json"
+    )
+    write_index(args.output_dir / index_name, index, args.overwrite)
+    if args.message_output_dir is not None:
+        message_metadata["num_items"] = total_items
+        message_index = {
+            "metadata": message_metadata,
+            "samples": [asdict(item) for item in message_index_samples],
+        }
+        write_index(args.message_output_dir / index_name, message_index, args.overwrite)
 
     print(f"Wrote cache: {args.output_dir}")
+    print(f"Wrote index: {args.output_dir / index_name}")
+    if args.message_output_dir is not None:
+        print(f"Wrote message cache: {args.message_output_dir}")
+        print(f"Wrote message index: {args.message_output_dir / index_name}")
     print(f"items={total_items}, tokens={total_tokens}, positives={total_positive}")
     print(f"positive_ratio={metadata['positive_ratio']:.6f}")
 

@@ -14,7 +14,7 @@ POST_LAUNCH_WAIT_SEC=600  # 10 minutes
 OOM_KEYWORD="Error"
 
 COMMANDS=(
-    "bash /data2/chenjq24/SpatialLM/run_point_token_scorer_context_bf16.sh"
+    "bash /data2/chenjq24/SpatialLM/run_scripts/run_train_stage2_filtered_point_tokens.sh"
 )
 
 LOG_FILES=(
