@@ -73,11 +73,24 @@ def read_scene_ids(
             return sorted(pred_scene_ids)
         return sorted(path.stem for path in gt_dir.glob("*.txt"))
 
+    if metadata.suffix.lower() == ".txt":
+        scene_ids = [
+            line.strip()
+            for line in metadata.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if len(scene_ids) != len(set(scene_ids)):
+            raise ValueError(f"{metadata} contains duplicate scene ids.")
+        return scene_ids
+
     with metadata.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if "id" not in (reader.fieldnames or []):
             raise ValueError(f"{metadata} must contain an 'id' column.")
-        return [row["id"] for row in reader]
+        scene_ids = [row["id"] for row in reader]
+    if len(scene_ids) != len(set(scene_ids)):
+        raise ValueError(f"{metadata} contains duplicate scene ids.")
+    return scene_ids
 
 
 def read_text(path: Path, missing_pred: str) -> str:
@@ -181,17 +194,23 @@ def micro_metric(
     )
 
 
-def normalize_objects(layout: Layout, class_map: dict[str, str] | None, minimum_scale: float) -> list:
+def normalize_objects(
+    layout: Layout,
+    class_map: dict[str, str] | None,
+    minimum_scale: float,
+    object_classes: list[str],
+) -> list:
     if class_map:
         layout.bboxes = base_eval.assign_class_map(layout.bboxes, class_map)
     else:
         for bbox in layout.bboxes:
             bbox.class_name = bbox.class_name.replace("_", " ")
-        layout.bboxes = [
-            bbox for bbox in layout.bboxes if bbox.class_name in base_eval.OBJECTS
-        ]
+    allowed_classes = set(object_classes)
+    layout.bboxes = [
+        bbox for bbox in layout.bboxes if bbox.class_name in allowed_classes
+    ]
     base_eval.assign_minimum_scale(layout.bboxes, minimum_scale=minimum_scale)
-    return [bbox for bbox in layout.bboxes if bbox.class_name in base_eval.OBJECTS]
+    return layout.bboxes
 
 
 def layout_instances(layout: Layout) -> list:
@@ -209,6 +228,7 @@ def evaluate_objects(
     gt_dir: Path,
     pred_dir: Path,
     class_map: dict[str, str] | None,
+    object_classes: list[str],
     minimum_scale: float,
     missing_pred: str,
 ) -> dict[float, dict[str, list[base_eval.EvalTuple]]]:
@@ -220,10 +240,20 @@ def evaluate_objects(
     for scene_id in scene_ids:
         pred_layout = load_layout(pred_dir / f"{scene_id}.txt", missing_pred)
         gt_layout = load_layout(gt_dir / f"{scene_id}.txt")
-        pred_objects = normalize_objects(pred_layout, class_map, minimum_scale)
-        gt_objects = normalize_objects(gt_layout, class_map, minimum_scale)
+        pred_objects = normalize_objects(
+            pred_layout,
+            class_map,
+            minimum_scale,
+            object_classes,
+        )
+        gt_objects = normalize_objects(
+            gt_layout,
+            class_map,
+            minimum_scale,
+            object_classes,
+        )
 
-        for class_name in base_eval.OBJECTS:
+        for class_name in object_classes:
             pred_class = [
                 entity for entity in pred_objects
                 if base_eval.get_entity_class(entity) == class_name
@@ -535,8 +565,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_LABEL_MAPPING if DEFAULT_LABEL_MAPPING.exists() else None,
     )
+    parser.add_argument(
+        "--no_label_mapping",
+        action="store_true",
+        help="Evaluate prediction/GT class names directly without a mapping TSV.",
+    )
     parser.add_argument("--label_from", default="spatiallm59")
     parser.add_argument("--label_to", default="spatiallm20")
+    parser.add_argument(
+        "--object_classes",
+        nargs="+",
+        default=None,
+        help=(
+            "Object classes to evaluate. Defaults to eval.py's SpatialLM20 list. "
+            "Use quoted values for class names containing spaces."
+        ),
+    )
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--expand_fraction", type=float, default=0.25)
     parser.add_argument("--minimum_scale", type=float, default=0.1)
@@ -585,9 +629,13 @@ def main() -> None:
         "stage1_pred_dir": str(args.stage1_pred_dir) if args.stage1_pred_dir else None,
         "gt_region_dir": str(args.gt_region_dir) if args.gt_region_dir else None,
     }
+    object_classes = args.object_classes or list(base_eval.OBJECTS)
+    if len(object_classes) != len(set(object_classes)):
+        raise ValueError("--object_classes contains duplicate class names.")
+    json_result["object_classes"] = object_classes
 
     class_map = None
-    if args.label_mapping is not None:
+    if args.label_mapping is not None and not args.no_label_mapping:
         class_map = base_eval.read_label_mapping(
             str(args.label_mapping), args.label_from, args.label_to
         )
@@ -615,18 +663,19 @@ def main() -> None:
             args.gt_dir,
             args.object_pred_dir,
             class_map,
+            object_classes,
             args.minimum_scale,
             args.missing_pred,
         )
         object_metrics = print_class_table(
             "Object Class Metrics",
             "Objects",
-            base_eval.OBJECTS,
+            object_classes,
             object_classwise,
             args.show_empty_classes,
         )
-        print_summary_table("Object Summary", base_eval.OBJECTS, object_metrics)
-        json_result["objects"] = metrics_to_dict(object_metrics, base_eval.OBJECTS)
+        print_summary_table("Object Summary", object_classes, object_metrics)
+        json_result["objects"] = metrics_to_dict(object_metrics, object_classes)
 
     if args.stage1_pred_dir is not None and not args.skip_regions:
         region_tuples = evaluate_regions(

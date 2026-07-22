@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from train_point_token_scorer import PointTokenScorer, ScorerConfig
+from spatiallm.model.point_token_scorer import PointTokenScorer, ScorerConfig
 from train_stage2_attention_scorer import (
     DEFAULT_MODEL_PATH,
     AttentionScorerCacheDataset,

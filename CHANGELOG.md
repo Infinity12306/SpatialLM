@@ -1,5 +1,148 @@
 # 更新日志
 
+## 未提交：添加仅移除 GT layout point token 的分层推理消融
+- 摘要：新增最小 oracle ablation，在 Hier-20k Res16 Max4096 的 Stage 2 中保留原始中心裁剪后的 token 顺序，仅删除 final voxel 与 GT `Wall`、`Door`、`Window` 相交的 point token，再复用现有 predicted-region inference、NMS 和 SpatialLM20 eval。
+- 详情：过滤发生在原有 `max_point_tokens=4096` 中心裁剪之后，因此保留 token 是 baseline LLM 输入的严格子序列，不会从裁剪窗口外补入 token；默认 layout bbox 不额外扩张，并在每个 inference shard 的日志末尾汇总裁剪、删除和保留 token 数。
+
+### 文件
+- `inference_hierarchical_pred_region_evict.py`：复用既有 GT-assisted predicted-region 推理，添加局部坐标 layout bbox 构造和仅作用于 Stage 2 的 token 删除 hook。
+- `inference_hierarchical_remove_gt_layout_tokens.py`：新增默认关闭 evict/GT object mask、启用 GT layout token 删除的轻量入口。
+- `run_scripts/inference_and_eval/run_inference_hierarchical_remove_gt_layout_tokens.sh`：新增多 GPU 分片 inference + NMS@0.1 + layout/region/object eval 一键脚本，默认与主 Hier-20k Res16 Max4096 的 stage1-9996/stage2-14000 结果对齐。
+
+## 未提交：添加 joint scorer 分层推理与评测入口
+- 摘要：新增面向 online joint LLM + hard scorer 训练产物的多分片 inference + NMS + eval 脚本，确保 stage-2 model 和 `scorer.pt` 始终来自同一 checkpoint。
+
+### 文件
+- `run_scripts/inference_and_eval/run_inference_hierarchical_joint_scorer.sh`：自动选择最新的完整 model/scorer 配对，在 500-scene SpatialLM test split 上运行 predicted-region scorer inference、NMS@0.1 和 layout/region/object 评估。
+
+## 未提交：添加分层模型相对 SpatialLM baseline 的逐场景改进筛选
+- 摘要：新增 SpatialLM20 object bbox 逐场景对比工具，复用正式 evaluator 的类别映射、minimum scale 和 Hungarian matching，在相同 NMS@0.1 结果上按 IoU 0.25/0.50 micro F1 提升筛选适合报告可视化的场景。
+- 详情：默认比较 SpatialLM baseline 与 Hier-20k Res16 Max4096 stage1-9996/stage2-14000 的 500 个 test scenes；排序分数为两个 IoU 阈值 F1 增量均值，报告候选默认要求至少 3 个 GT objects 且两个阈值均不退化，同时输出完整 CSV/JSON、类别级变化和点云/GT/预测路径。
+- 详情：新增前五名场景的批量对比渲染入口，每个相机只栅格化一次点云，再分别叠加 GT、SpatialLM 与分层方法的 object bbox；三路类别统一映射到相同类别名并使用固定颜色，显式忽略 wall、door、window 和 region，输出三方单图、全分辨率三列对比图及 3x3 对比总览。
+
+### 文件
+- `select_hierarchical_improved_scenes.py`：新增逐场景 object metric 计算、聚合指标复核、候选过滤、排序和报告产物生成 CLI。
+- `render_top5_scene_comparisons.py`：新增五场景、九视角的 GT/SpatialLM/Hier object-bbox 高效对比渲染脚本，并固定三路类别颜色。
+
+## 未提交：添加 end-to-end attention scorer 的 SpatialLM20 评测入口
+- 摘要：新增固定参数的两分片评测脚本，使用 `checkpoint-40000` 的 end-to-end attention scorer 对预测 Region 的 stage2 point tokens 做 hard top-k 筛选，并依次执行 object bbox NMS 和 SpatialLM20 layout/region/object 评测。
+- 详情：先将 encoder token 中心裁到训练时的 `max_point_tokens=3200`，再按 scorer logits 选取得分最高的 `min(1536, token_count)` 个 tokens；选中索引恢复为 Sonata 原始顺序后输入 LLM。推理入口同时保留 soft attention-bias 模式用于后续 ablation，但当前一键评测固定使用 hard top-k 1536。
+
+### 文件
+- `inference_hierarchical_attention_scorer.py`：新增预测 Region 的 end-to-end attention-scorer 推理入口，支持 hard top-k 和训练同构的 soft attention key bias 两种模式。
+- `run_scripts/inference_and_eval/run_inference_hierarchical_attention_scorer_e2e_40000_2shards.sh`：新增 checkpoint-40000 attention scorer 的 inference + NMS + eval 一键入口，所有参数直接保存在 shell 脚本中。
+
+## 未提交：支持在现有 ScanNet raw 预测上对比 NMS IoU 0.25
+- 摘要：新增不重跑 inference 的 SpatialLM baseline 与分层方法联合后处理脚本，分别对现有 test-half raw 预测执行 class-wise 3D bbox NMS 0.25 和 ScanNet18 eval。
+
+### 文件
+- `run_scripts/inference_and_eval/run_scannet18_spatiallm_ours_nms025_eval.sh`：校验两种方法各 156 个场景的 raw 预测，产出独立的 `nms_iou_0.25` 目录、日志和评估 JSON。
+
+## 未提交：添加 filtered-token restart epoch2 的 SpatialLM20 评测入口
+- 摘要：新增固定参数的两分片评测脚本，对 scorer-filtered point-token restart-epoch2 stage2 checkpoint 依次执行预测 Region 分层推理、object bbox NMS 和 SpatialLM20 layout/region/object 评测。
+- 详情：stage1 使用 `checkpoint-9996`，stage2 使用 `checkpoint-28784`，scorer 使用 `checkpoint-29488`；推理采用 greedy decoding、scorer threshold 0.5、最多保留 4096 个 point tokens，并执行 class-wise 3D NMS@0.1。
+
+### 文件
+- `run_scripts/inference_and_eval/run_inference_hierarchical_scorer_filtered_point_token_restart_epoch2_2shards.sh`：新增 inference + NMS + eval 一键入口，所有非训练参数直接保存在 shell 脚本中。
+
+## 未提交：添加点云九视角 object-bbox 可视化
+- 摘要：新增单场景无窗口软件渲染器，支持按 z 轴顶部百分比裁剪、以主体包围盒最长边统一缩放并保持长宽高比例、可选 SpatialLM object bbox overlay，以及四个角点方向、四条水平边中点方向的 45°斜上方视角和 top-down 视角输出。
+- 详情：可选按 x/y/z 每轴两端分位数快速剔除离群点，默认每端 0.5%，仅让主体参与归一化、渲染和 normalized PLY；原坐标 z 裁剪 PLY 仍保留全部点，参数设为 0 时以全部 z 裁剪点的 AABB 最长边归一化。
+- 详情：每张视角图片的宽高可通过 `--width`、`--height` 独立指定，默认分辨率为 2048x2048；3x3 contact sheet 随单张图片尺寸自动调整。
+- 详情：预测 txt 仅解析 `Bbox` 实体，显式忽略 wall、door、window 和 region；同时保存原坐标裁剪 PLY、归一化主体 PLY、九张 PNG、按方位排列的 3x3 contact sheet 和完整变换/camera metadata。
+
+### 文件
+- `render_scene_multiview.py`：新增 raw PCD 裁剪、object bbox 同步变换、headless pinhole rasterization、z-buffer point splatting 和多视角输出 CLI。
+
+## 未提交：添加 V-DETR ScanNet18 test-half 数据适配与评估流程
+- 摘要：在 `V-DETR/` 内新增 evaluation-only ScanNet18 数据适配器和 inference + NMS + common P/R/F1 eval 入口，使用与 SpatialLM 对比一致的 156 场景 test-half。
+- 摘要：新增 YAML 驱动的官方完整 validation split 入口，增量准备并强制校验 312 个场景后复用同一后处理和 P/R/F1 evaluator。
+- 摘要：新增 full-val native mAP + common P/R/F1 combined runner；native mAP 保留 V-DETR 原生 per-class proposal 逻辑，P/R/F1 保留每个 query 一个 argmax class 的通用导出逻辑。
+- 修正：native mAP 阶段不再传入 common P/R/F1 的 0.5 objectness/semantic threshold 和空框过滤；现在严格调用 README 的 `main.py --test_only --auto_test` 默认评估路径（confidence 0、NMS 0.25、`exact_eval=False`、per-class proposals）。
+- 摘要：新增 full-val no-empty P/R/F1 ablation，仅关闭 predicted empty-box filtering，保留 objectness/semantic 0.5、argmax class、class-wise NMS@0.25 和通用 evaluator，不计算 mAP。
+- 数据源：确认原始 ScanNet 位于 `/nas1/huyueyang23/dataset/scannet/scannet`；1,513 个场景均具备 V-DETR/ScanNet exporter 所需的 mesh、aggregation、segmentation 和 axis-alignment metadata，派生数据仍统一写入 `/nas1/chenjunqing2024/scannet`。
+- 详情：适配器从已有 axis-aligned PLY 和 ScanNet18 layout GT 生成 V-DETR loader 需要的 `vert/bbox/sem_label/ins_label` NPY；semantic/instance 是仅用于测试 loader 兼容的等长零占位，不可用于训练。
+- 详情：评估入口调用 V-DETR 原生 `main.py --test_only --auto_test`，每个 query 只保留 argmax class；依次执行 `p_obj >= 0.5`、`max p_cls >= 0.5`、默认空框过滤（至少 5 点）和 V-DETR 默认 class-wise 3D NMS@0.25，导出通用 `Bbox` txt 后交给 `eval_hierarchical.py` 报告 IoU 0.25/0.50 的 P/R/F1，不计算原生 AP。
+- 详情：修复当前代码与发布 checkpoint 间缺失模型参数的 `auto_reload` 兼容，以及 ScanNet tensor-list point cloud 在单/多 GPU gather 中的错误，使原生 CUDA 空框过滤可以接收 `[B,N,C]` 点云。
+
+### 文件
+- `V-DETR/prepare_scannet18_eval_data.py`：新增支持 process workers、shards、断点跳过、manifest 和 verify-only 的测试数据适配器。
+- `V-DETR/main.py`：新增按 scene index 导出 NMS 后 ScanNet18 bbox、类别别名归一化与跳过 native AP 开关。
+- `V-DETR/engine.py`：按 inference 参数显式启用 V-DETR 空框过滤。
+- `V-DETR/utils/ap_calculator.py`：累积 NMS 后预测时使用 dataset `scan_idx`，保证单/多 GPU 下预测与 scene id 一致。
+- `V-DETR/utils/dist.py`：正确 stack/gather ScanNet collate 返回的 point-cloud tensor list。
+- `V-DETR/run_scannet18_inference_nms_eval.sh`：新增 `vdetr` conda 环境下的数据校验、单/多 GPU 预测导出和通用 P/R/F1 评估入口。
+- `V-DETR/configs/scannet18_full_val_eval.yaml`：完整 312-scene val 的数据、checkpoint、后处理与输出配置。
+- `V-DETR/run_scannet18_full_val_inference_nms_eval.sh`：读取 YAML、增量准备/校验 full-val 数据并调用通用 V-DETR pipeline。
+- `V-DETR/run_scannet18_full_val_map_prf_eval.sh`：顺序执行 V-DETR native mAP 和 common P/R/F1 两个 full-val 阶段，避免混用不同 proposal 定义。
+- `V-DETR/run_scannet18_full_val_prf_no_empty_eval.sh`：在独立输出目录评估不做预测空框过滤的 full-val P/R/F1。
+- `V-DETR/SCANNET18_EVAL.md`：新增数据处理、完整性检查、推理和指标解释命令。
+
+## 未提交：添加 SpatialLM ScanNet18 baseline 推理、NMS 和评估流程
+- 摘要：复用 `test_model_checkpoint.py`、`apply_bbox_nms.py` 和 `eval_hierarchical.py`，新增面向 ScanNet test-half 的 SpatialLM 单阶段 bbox baseline 多 GPU 分片推理、NMS 和 object-only 评估入口。
+- 详情：运行脚本使用数据 JSON 中与微调一致的 `Detect boxes.` prompt，支持自动选择输出目录中最新的有效 checkpoint，并在推理完成后校验 156 个 test-half 预测文件。
+
+### 文件
+- `run_scripts/inference_and_eval/run_scannet18_spatiallm_baseline_inference_nms_eval.sh`：新增 SpatialLM baseline 一键 pipeline，预测和评估产物默认写入 `/nas1/chenjunqing2024/scannet`。
+
+## 未提交：添加 ScanNet18 分层推理、NMS 和评估流程
+- 摘要：复用现有分层推理和按类别 3D bbox NMS，新增面向 ScanNet test-half 的多 GPU 分片推理、结果完整性校验与评估编排脚本。
+- 详情：扩展分层 evaluator，支持每行一个 scene id 的 txt split、显式 object class 列表和禁用 label mapping，从而直接评估 ScanNet18（含 door/window）。
+
+### 文件
+- `eval_hierarchical.py`：新增 txt metadata、`--object_classes` 和 `--no_label_mapping`，同时保留原有 SpatialLM20 默认行为。
+- `run_scripts/inference_and_eval/run_scannet18_ours_inference_nms_eval.sh`：新增 ScanNet18 test-half 一键 inference + NMS + object/region eval 入口，一张 GPU 对应一个 shard，所有预测和指标产物默认写入 `/nas1/chenjunqing2024/scannet`。
+
+## 未提交：添加在线 point-token scorer 联合训练
+- 摘要：使用原始 SpatialLM 初始化 scorer，并在线联合训练 point encoder、hard scorer 和 LLM。
+- 详情：为 Sonata 添加 packed-batch 编码路径，用单次 encoder forward 处理 local batch，并返回 final token 的 batch/offset 元数据。
+- 详情：在 GPU 上按 batch 计算 final voxel 与 1.2 倍 GT object bbox 的重叠标签；scorer 使用 BCE loss，hard-filtered token 的 next-token loss 回传到 LLM、point projector 和 point encoder。
+- 详情：原始 SpatialLM scorer 初始化直接读取 raw PCD，在线执行 packed-batch encoder/projector forward 和 GPU GT mask 构建，不再预计算 feature cache；支持 cosine warmup、最新 checkpoint 恢复、剩余 step scheduler 重建、WandB clean-copy 和 CUDA_VISIBLE_DEVICES 记录。
+
+### 文件
+- `spatiallm/model/point_token_scorer.py`：抽取共享 scorer，并新增 packed-to-padded、batched GPU bbox label、BCE 和顺序保持的 hard selection。
+- `spatiallm/model/sonata_encoder.py`：返回 final token 的 `batch` 和 `offset`。
+- `spatiallm/model/spatiallm_llama.py`、`spatiallm/model/spatiallm_qwen.py`：添加 packed point-cloud batch encoding 和联合 scorer loss/selection 路径。
+- `spatiallm/tuner/data/mm_plugin.py`：支持 packed point-cloud collate，并单独输出 scorer GT bboxes，不启用 GT oracle filtering。
+- `spatiallm/tuner/data/template.py`、`spatiallm/tuner/hparams/data_args.py`、`spatiallm/tuner/trainer.py`：接线 batch encoding 和 online scorer GT mask 数据参数。
+- `train_point_token_scorer.py`：保留 cache-based scorer trainer，供已有离线缓存实验复现。
+- `train_point_token_scorer_online.py`：新增原始 SpatialLM scorer 在线初始化训练器；只将 frozen point encoder/projector 搬到 GPU，raw PCD augmentation、packed encoding、GPU GT mask 和 scorer BCE 在同一训练流程完成，并在 checkpoint 保存累计标签统计。
+- `train_stage2_joint_scorer.py`：新增 online hard-selection 联合训练器、scorer 初始化加载、独立 scorer checkpoint 和联合指标记录。
+- `configs/scorer/point_token_scorer_spatiallm_original.yaml`：原始 SpatialLM encoder/projector 的 scorer 初始化训练配置。
+- `configs/spatiallm_stage2_joint_scorer.yaml`：stage2 online LLM + scorer 联合训练配置；从 `configs/scorer/` 移出并添加 `spatiallm_` 前缀，使该子目录只保留纯 scorer 训练配置。
+- `run_scripts/run_train_point_token_scorer_spatiallm_original.sh`、`run_scripts/run_train_stage2_joint_scorer.sh`：在线 scorer 初始化和联合训练入口；原始 SpatialLM scorer 不再需要独立 cache 预计算入口。
+
+## 5e8212c08e82f1335ea75dfdd2239fddd3465fce
+- 摘要：Add cached point-token stage-2 scorer and filtering workflows
+- 作者：Junqing Chen <junqingchen03@gmail.com>
+- 日期：2026-07-19 12:35:55 +0800
+- 详情：扩展 point-token scorer 缓存预计算，支持确定性 epoch 分片、对齐的消息缓存及分片索引合并。
+- 详情：为 SpatialLM Llama/Qwen 添加预计算 point-token feature 输入，并新增 attention scorer、过滤 token 训练和 oracle 推理流程。
+- 详情：补充缓存过滤、复现验证、I/O 测量、压力测试、评估结果和后续开发上下文，同时更新实验规范与启动配置。
+
+### 文件
+- `.gitignore`：扩展本地产物忽略规则，覆盖 `logs/`、整个 `configs/` 目录、`data/` 和 `run_scripts/`。
+- `AGENTS.md`：补充训练任务的 WandB 记录、cosine scheduler、恢复训练、YAML 配置、shard 数据处理和 DataLoader 效率规范。
+- `CHANGELOG.md`：添加上一条 point-token bbox mask、evict 和 scorer 工具提交的元数据及逐文件摘要。
+- `NEXT_AGENT_CONTEXT.md`：新增开发交接文档，汇总仓库结构、两阶段方法、缓存与 scorer 工作流、实验结果、常用命令和待办事项。
+- `build_attention_scorer_stress_topk_cache.py`：新增 attention scorer 压力样本构建器，按插入后的序列长度从 feature/message 缓存中选取 top-k 样本。
+- `eval_results.md`：新增评估对比文档，以表格汇总不同分层、mask、evict、scorer 和 attention-oracle 方法的 region、layout 与 object 指标。
+- `filter_point_tokens_with_scorer.py`：新增 scorer 驱动的 point-token 缓存过滤器，支持批量打分、阈值与数量约束、并行分片和对齐消息缓存。
+- `inference_hierarchical_attention_oracle.py`：新增 attention-oracle 分层推理脚本，使用第 2 阶段模型的末层注意力分数筛选 point token。
+- `measure_pt_read_time.py`：新增 `.pt` 缓存读取基准工具，可统计文件、item 和字节吞吐并导出逐文件 CSV。
+- `merge_filtered_point_token_cache_indices.py`：新增过滤缓存的并行分片索引合并工具，负责校验元数据、排序样本并汇总 token 统计。
+- `merge_point_token_cache_indices.py`：新增 scorer feature 缓存及可选 message 缓存的 epoch 分片索引合并工具。
+- `precompute_point_token_cache_messages.py`：新增与现有 point-token feature shard 对齐的预处理消息缓存生成工具。
+- `precompute_point_token_scorer_data.py`：添加全随机源确定性播种、显式 epoch 选择与分片、同步消息缓存输出、覆盖保护和部分索引写入。
+- `spatiallm/model/spatiallm_llama.py`：支持跳过 point backbone、直接插入带 NaN padding 的预计算 point-token features，并将其贯穿生成输入和标签对齐逻辑。
+- `spatiallm/model/spatiallm_qwen.py`：支持跳过 point backbone、直接插入带 NaN padding 的预计算 point-token features，并将其贯穿生成输入和标签对齐逻辑。
+- `stress_test.py`：新增通用 GPU 显存与矩阵乘压力工具，可按目标显存、持续时间和 dtype 运行负载。
+- `stress_test_stage2_attention_scorer.py`：新增第 2 阶段 attention scorer 压力测试，使用最长缓存样本测量固定 batch 的训练、评估、吞吐和峰值显存。
+- `train_stage2_attention_scorer.py`：新增端到端 attention scorer 训练器，通过冻结的第 2 阶段 SpatialLM 优化 attention bias，并支持 YAML、WandB clean-copy、cosine warmup、分片 DataLoader 和 checkpoint 恢复。
+- `train_stage2_filtered_point_tokens.py`：新增从 scorer 过滤后的投影 point-token 缓存训练第 2 阶段 SpatialLM 的流程，支持 shard-local batch、YAML 配置、WandB 和按剩余步数重建 scheduler 的自动恢复。
+- `verify_point_token_scorer_cache_reproducibility.py`：新增 scorer 缓存复现检查器，从元数据恢复样本并比较 feature、grid、标签和区域中心。
+- `wait_for_gpu_and_train.sh`：将 GPU 排队启动目标切换为过滤 point-token 的第 2 阶段训练脚本。
+
 ## 02c6f623920e0b3f2b90ebef99e929214794a68c
 - 摘要：Add point-token bbox masking, evict workflows, and scorer tooling
 - 作者：Codex <codex@openai.com>

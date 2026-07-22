@@ -31,7 +31,7 @@ from spatiallm.tuner.data.template import (
     register_spatiallm_templates,
 )
 from spatiallm.tuner.hparams.data_args import DataArguments
-from train_point_token_scorer import PointTokenScorer, ScorerConfig
+from spatiallm.model.point_token_scorer import PointTokenScorer, ScorerConfig
 
 
 DEFAULT_CACHE_ROOT = Path(

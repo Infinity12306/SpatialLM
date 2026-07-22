@@ -320,6 +320,8 @@ def register_spatiallm_templates(
     random_rotation: bool = False,
     point_token_bbox_mask: bool = False,
     point_token_bbox_expand_ratio: float = 0.1,
+    point_cloud_batch_encoding: bool = False,
+    point_token_scorer_gt_mask: bool = False,
 ):
     register_template(
         name="spatiallm_llama",
@@ -346,6 +348,8 @@ def register_spatiallm_templates(
             random_rotation=random_rotation,
             point_token_bbox_mask=point_token_bbox_mask,
             point_token_bbox_expand_ratio=point_token_bbox_expand_ratio,
+            point_cloud_batch_encoding=point_cloud_batch_encoding,
+            point_token_scorer_gt_mask=point_token_scorer_gt_mask,
         ),
         cutoff_len=cutoff_len,
     )
@@ -369,6 +373,8 @@ def register_spatiallm_templates(
             random_rotation=random_rotation,
             point_token_bbox_mask=point_token_bbox_mask,
             point_token_bbox_expand_ratio=point_token_bbox_expand_ratio,
+            point_cloud_batch_encoding=point_cloud_batch_encoding,
+            point_token_scorer_gt_mask=point_token_scorer_gt_mask,
         ),
         cutoff_len=cutoff_len,
     )

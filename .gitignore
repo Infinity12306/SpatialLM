@@ -183,9 +183,11 @@ logs/
 spatiallm-dataset-link
 
 ours/scripts/
-configs/
-!/data2/chenjq24/SpatialLM/configs/spatiallm_hierarchical_20000.yaml
-!/data2/chenjq24/SpatialLM/configs/spatiallm_sft.yaml
+configs/*
+!configs/spatiallm_hierarchical_20000.yaml
+!configs/spatiallm_sft.yaml
+!configs/spatiallm_stage2_joint_scorer.yaml
+!configs/scorer/point_token_scorer_spatiallm_original.yaml
 
 tmp.*
 run.sh
@@ -197,4 +199,20 @@ proposal/
 reports/
 .vscode/
 data/
-run_scripts/
+run_scripts/*
+!run_scripts/run_train_point_token_scorer_spatiallm_original.sh
+!run_scripts/run_train_stage2_joint_scorer.sh
+
+V-DETR/
+scenescript/
+run_scripts
+quali_results/
+
+stress_test*.py
+build_scannet_hierarchical_dataset.py
+build_scannet_spatiallm_bbox_dataset.py
+split_scannet_val_test.py
+wandb_workspace_setup.md
+render_scene_multiview.py
+select_hierarchical_improved_scenes.py
+select_scannet_longest_sequences.py

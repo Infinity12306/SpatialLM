@@ -1004,6 +1004,7 @@ class Sonata(PointModule, PyTorchModelHubMixin):
 
         point = self.enc(point)
         context = point["sparse_conv_feat"].features
+        token_batch = point["batch"]
         keep_bboxes = data_dict.get("point_token_keep_bboxes")
         if keep_bboxes is not None:
             keep_mask = point_token_bbox_overlap_mask(
@@ -1012,6 +1013,7 @@ class Sonata(PointModule, PyTorchModelHubMixin):
                 self.final_voxel_size,
             )
             point["grid_coord"] = point["grid_coord"][keep_mask]
+            token_batch = token_batch[keep_mask]
             context = context[keep_mask]
 
         if self.enable_fourier_encode:
@@ -1023,5 +1025,10 @@ class Sonata(PointModule, PyTorchModelHubMixin):
             context = self.input_proj(context)
 
         if data_dict.get("return_grid_coord", False):
-            return {"context": context, "grid_coord": point["grid_coord"]}
+            return {
+                "context": context,
+                "grid_coord": point["grid_coord"],
+                "batch": token_batch,
+                "offset": batch2offset(token_batch),
+            }
         return context

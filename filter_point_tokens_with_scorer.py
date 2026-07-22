@@ -22,7 +22,7 @@ from precompute_point_token_scorer_data import (
     sample_seed,
 )
 from spatiallm.tuner.data.mm_plugin import SpatialLMPlugin
-from train_point_token_scorer import (
+from spatiallm.model.point_token_scorer import (
     PointTokenScorer,
     ScorerConfig,
     load_frozen_point_projector,

@@ -276,6 +276,8 @@ class ReporterCallback(TrainerCallback):
 
             wandb.config.update(
                 {
+                    "wandb_project": os.environ.get("WANDB_PROJECT"),
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "model_args": self.model_args.to_dict(),
                     "data_args": self.data_args.to_dict(),
                     "finetuning_args": self.finetuning_args.to_dict(),

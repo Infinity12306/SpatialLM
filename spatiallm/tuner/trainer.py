@@ -115,6 +115,8 @@ def run_sft(
         random_rotation=data_args.random_rotation,
         point_token_bbox_mask=data_args.point_token_bbox_mask,
         point_token_bbox_expand_ratio=data_args.point_token_bbox_expand_ratio,
+        point_cloud_batch_encoding=data_args.point_cloud_batch_encoding,
+        point_token_scorer_gt_mask=data_args.point_token_scorer_gt_mask,
     )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

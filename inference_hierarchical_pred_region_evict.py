@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import torch
@@ -43,6 +44,10 @@ from inference_hierarchical import (
 )
 from spatiallm import Layout
 from spatiallm.layout.entity import Bbox, Region
+from spatiallm.model import PointBackboneType
+from spatiallm.model.point_token_scorer import (
+    batched_point_token_bbox_overlap_labels,
+)
 
 
 LAYOUT_LABELS = {"wall", "door", "window"}
@@ -167,6 +172,148 @@ def keep_bboxes_from_gt_bboxes(
             ]
         )
     return torch.tensor([rows], dtype=torch.float32)
+
+
+def remove_bboxes_from_layout_boxes(
+    layout_boxes: list[dict],
+    min_extent: np.ndarray,
+    expand_ratio: float,
+) -> torch.Tensor:
+    """Convert world-space Wall/Door/Window boxes to local yaw boxes."""
+    if not layout_boxes:
+        return torch.empty((1, 0, 7), dtype=torch.float32)
+
+    scale_multiplier = 1.0 + 2.0 * expand_ratio
+    rows = []
+    for box in layout_boxes:
+        center = np.asarray(box["center"], dtype=np.float32) - min_extent
+        scale = np.abs(np.asarray(box["scale"], dtype=np.float32))
+        rotation = np.asarray(box["rotation"], dtype=np.float32)
+        angle_z = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+        rows.append(
+            [
+                center[0],
+                center[1],
+                center[2],
+                scale[0] * scale_multiplier,
+                scale[1] * scale_multiplier,
+                scale[2] * scale_multiplier,
+                angle_z,
+            ]
+        )
+    return torch.tensor([rows], dtype=torch.float32)
+
+
+def center_crop_context_and_grid(
+    context: torch.Tensor,
+    grid_coord: torch.Tensor,
+    max_tokens: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply SpatialLM's sequence-center crop to aligned token tensors."""
+    if max_tokens is None or context.shape[0] <= max_tokens:
+        return context, grid_coord
+    start = (context.shape[0] - max_tokens) // 2
+    end = start + max_tokens
+    return context[start:end], grid_coord[start:end]
+
+
+def install_layout_token_removal(stage2_model, args: argparse.Namespace) -> None:
+    """Remove final point tokens overlapping the current GT layout boxes."""
+    if stage2_model.point_backbone_type != PointBackboneType.SONATA:
+        raise NotImplementedError(
+            "Layout-token removal inference currently supports Sonata only."
+        )
+
+    stage2_model._point_token_remove_layout_bboxes = None
+    stage2_model._layout_token_filter_context = ""
+    stage2_model._layout_token_filter_stats = {
+        "calls": 0,
+        "cropped_tokens": 0,
+        "removed_tokens": 0,
+        "kept_tokens": 0,
+    }
+
+    def layout_filtered_forward_point_cloud(
+        self,
+        point_cloud: torch.Tensor,
+        device,
+        dtype,
+        point_token_keep_bboxes=None,
+    ):
+        if point_token_keep_bboxes is not None:
+            raise ValueError(
+                "Layout-token removal cannot be combined with GT object-token keeping."
+            )
+
+        self.point_backbone.to(torch.float32)
+        valid = ~torch.isnan(point_cloud).any(dim=1)
+        point_cloud = point_cloud[valid]
+        if point_cloud.shape[0] == 0:
+            raise ValueError("Point cloud has no valid points after removing NaNs.")
+
+        coords = point_cloud[:, :3].to(device=device, dtype=torch.int64)
+        feats = point_cloud[:, 3:].to(device=device, dtype=torch.float32)
+        with torch.inference_mode():
+            encoded = self.point_backbone(
+                {
+                    "coord": feats[:, :3],
+                    "grid_coord": coords,
+                    "feat": feats,
+                    "batch": torch.zeros(
+                        coords.shape[0], dtype=torch.long, device=device
+                    ),
+                    "return_grid_coord": True,
+                }
+            )
+            context = encoded["context"]
+            grid_coord = encoded["grid_coord"].to(torch.int32)
+            context, grid_coord = center_crop_context_and_grid(
+                context,
+                grid_coord,
+                self.max_point_tokens,
+            )
+
+            cropped_tokens = int(context.shape[0])
+            remove_bboxes = self._point_token_remove_layout_bboxes
+            removed_tokens = 0
+            if remove_bboxes is not None and remove_bboxes.shape[1] > 0:
+                token_mask = torch.ones(
+                    (1, cropped_tokens),
+                    dtype=torch.bool,
+                    device=grid_coord.device,
+                )
+                remove_mask = batched_point_token_bbox_overlap_labels(
+                    grid_coord.unsqueeze(0),
+                    token_mask,
+                    remove_bboxes.to(grid_coord.device),
+                    self.point_backbone.final_voxel_size,
+                )[0]
+                removed_tokens = int(remove_mask.sum().item())
+                context = context[~remove_mask]
+
+            kept_tokens = int(context.shape[0])
+            stats = self._layout_token_filter_stats
+            stats["calls"] += 1
+            stats["cropped_tokens"] += cropped_tokens
+            stats["removed_tokens"] += removed_tokens
+            stats["kept_tokens"] += kept_tokens
+            if args.layout_token_filter_debug:
+                print(
+                    "layout-token filter: "
+                    f"item={self._layout_token_filter_context}, "
+                    f"cropped={cropped_tokens}, removed={removed_tokens}, "
+                    f"kept={kept_tokens}",
+                    flush=True,
+                )
+
+            projector_dtype = next(self.point_proj.parameters()).dtype
+            point_tokens = self.point_proj(context.to(projector_dtype)).to(dtype)
+            return point_tokens.unsqueeze(0)
+
+    stage2_model.forward_point_cloud = MethodType(
+        layout_filtered_forward_point_cloud,
+        stage2_model,
+    )
 
 
 def evict_region_points(
@@ -339,14 +486,31 @@ def predict_hierarchical_scene(
                 args.bbox_mask_expand_ratio,
             )
 
-        stage2_generated = generate_layout_text(
-            stage2_model,
-            stage2_tokenizer,
-            stage2_prompt,
-            region_pcd.input_tensor,
-            args,
-            point_token_keep_bboxes=keep_bboxes,
-        )
+        if args.remove_gt_layout_tokens:
+            stage2_model._point_token_remove_layout_bboxes = (
+                remove_bboxes_from_layout_boxes(
+                    layout_boxes,
+                    region_pcd.min_extent,
+                    args.layout_mask_expand_ratio,
+                )
+            )
+            stage2_model._layout_token_filter_context = (
+                f"{scene.scene_id}/region_{region_index}"
+            )
+
+        try:
+            stage2_generated = generate_layout_text(
+                stage2_model,
+                stage2_tokenizer,
+                stage2_prompt,
+                region_pcd.input_tensor,
+                args,
+                point_token_keep_bboxes=keep_bboxes,
+            )
+        finally:
+            if args.remove_gt_layout_tokens:
+                stage2_model._point_token_remove_layout_bboxes = None
+                stage2_model._layout_token_filter_context = ""
         region_layout = decode_generated_layout(
             stage2_generated,
             region_pcd.min_extent,
@@ -381,6 +545,7 @@ def predict_hierarchical_scene(
 def parse_args(
     default_evict_points: bool = True,
     default_use_gt_bbox_mask: bool = False,
+    default_remove_gt_layout_tokens: bool = False,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         "Hierarchical inference with predicted regions and GT-assisted stage-2 filtering"
@@ -436,6 +601,22 @@ def parse_args(
         help="Use GT object boxes to mask final point tokens before LLM generation.",
     )
     parser.add_argument("--bbox_mask_expand_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--remove_gt_layout_tokens",
+        action=argparse.BooleanOptionalAction,
+        default=default_remove_gt_layout_tokens,
+        help=(
+            "After the normal max-point-token crop, remove final tokens whose "
+            "voxels overlap GT Wall/Door/Window boxes."
+        ),
+    )
+    parser.add_argument(
+        "--layout_mask_expand_ratio",
+        type=float,
+        default=0.0,
+        help="Per-side expansion ratio for GT layout boxes before token removal.",
+    )
+    parser.add_argument("--layout_token_filter_debug", action="store_true")
     parser.add_argument("--target_pt_num", type=int, default=1536)
     parser.add_argument("--num_bins", type=int, default=1280)
     parser.add_argument(
@@ -458,16 +639,31 @@ def parse_args(
         parser.error("--distance_chunk_size must be positive.")
     if any(stride <= 0 for stride in args.encoder_strides):
         parser.error("--encoder_strides must be positive integers.")
+    if args.bbox_mask_expand_ratio < 0:
+        parser.error("--bbox_mask_expand_ratio must be non-negative.")
+    if args.layout_mask_expand_ratio < 0:
+        parser.error("--layout_mask_expand_ratio must be non-negative.")
+    if args.remove_gt_layout_tokens and args.use_gt_bbox_mask:
+        parser.error(
+            "--remove_gt_layout_tokens cannot be combined with --use_gt_bbox_mask."
+        )
+    if args.remove_gt_layout_tokens and args.evict_points:
+        parser.error(
+            "--remove_gt_layout_tokens cannot be combined with --evict_points "
+            "in this isolated ablation."
+        )
     return args
 
 
 def main(
     default_evict_points: bool = True,
     default_use_gt_bbox_mask: bool = False,
+    default_remove_gt_layout_tokens: bool = False,
 ) -> int:
     args = parse_args(
         default_evict_points=default_evict_points,
         default_use_gt_bbox_mask=default_use_gt_bbox_mask,
+        default_remove_gt_layout_tokens=default_remove_gt_layout_tokens,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -495,6 +691,8 @@ def main(
         args.inference_dtype,
         args.device,
     )
+    if args.remove_gt_layout_tokens:
+        install_layout_token_removal(stage2_model, args)
 
     failures: list[tuple[str, str]] = []
     for scene in tqdm(scenes, desc="Hierarchical pred-region inference"):
@@ -528,6 +726,18 @@ def main(
         for scene_id, error in failures[:10]:
             print(f"{scene_id}: {error}", file=sys.stderr)
         return 1
+
+    if args.remove_gt_layout_tokens:
+        stats = stage2_model._layout_token_filter_stats
+        cropped_tokens = stats["cropped_tokens"]
+        removed_ratio = stats["removed_tokens"] / max(cropped_tokens, 1)
+        print(
+            "Layout-token filter summary: "
+            f"calls={stats['calls']}, cropped={cropped_tokens}, "
+            f"removed={stats['removed_tokens']}, kept={stats['kept_tokens']}, "
+            f"removed_ratio={removed_ratio:.6f}",
+            flush=True,
+        )
 
     print(f"Wrote hierarchical predictions to {args.output_dir}")
     return 0

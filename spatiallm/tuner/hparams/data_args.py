@@ -158,6 +158,24 @@ class DataArguments:
             )
         },
     )
+    point_cloud_batch_encoding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Pack all point clouds in a local batch and run the Sonata "
+                "encoder once using offsets instead of per-sample encoding."
+            )
+        },
+    )
+    point_token_scorer_gt_mask: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Return augmented GT object bboxes for online point-token "
+                "scorer supervision without applying GT filtering."
+            )
+        },
+    )
     do_augmentation: bool = field(
         default=False,
         metadata={"help": "Whether or not to do data augmentation."},

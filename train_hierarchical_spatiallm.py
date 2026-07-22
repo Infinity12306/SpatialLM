@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -121,7 +122,12 @@ def write_stage_config(stage_config: dict[str, Any], path: Path) -> None:
         yaml.safe_dump(stage_config, f, sort_keys=False)
 
 
-def run_stage(train_script: Path, stage_name: str, stage_config: dict[str, Any]) -> None:
+def run_stage(
+    train_script: Path,
+    stage_name: str,
+    stage_config: dict[str, Any],
+    wandb_project: str | None = None,
+) -> None:
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=f"_{stage_name}.yaml",
@@ -140,9 +146,15 @@ def run_stage(train_script: Path, stage_name: str, stage_config: dict[str, Any])
     print(f"[{stage_name}] eval_steps: {stage_config.get('eval_steps')}")
     if stage_config.get("resume_from_checkpoint") is not None:
         print(f"[{stage_name}] resume_from_checkpoint: {stage_config['resume_from_checkpoint']}")
+    env = None
+    if wandb_project:
+        env = dict(os.environ)
+        env["WANDB_PROJECT"] = wandb_project
+        print(f"[{stage_name}] wandb_project: {wandb_project}")
     subprocess.run(
         [sys.executable, str(train_script), str(config_path)],
         check=True,
+        env=env,
     )
 
 
@@ -284,6 +296,7 @@ def main() -> None:
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    wandb_project = config.get("wandb_project")
 
     config_stage2_only = bool(
         config.get("stage2_only", False) or config.get("skip_stage1", False)
@@ -354,6 +367,7 @@ def main() -> None:
                 {
                     "stage2_only": stage2_only,
                     "skip_stage2": skip_stage2,
+                    "wandb_project": wandb_project,
                     "stage1": stage1_config,
                     "stage2": stage2_config,
                 },
@@ -365,14 +379,24 @@ def main() -> None:
     if stage2_only:
         print("[stage1] skipped because stage2_only is enabled.")
     else:
-        run_stage(args.train_script, "stage1", stage1_config)
+        run_stage(
+            args.train_script,
+            "stage1",
+            stage1_config,
+            wandb_project=wandb_project,
+        )
 
     if skip_stage2:
         return
 
     resolve_auto_stage2_model_path(stage1_config, stage2_config)
 
-    run_stage(args.train_script, "stage2", stage2_config)
+    run_stage(
+        args.train_script,
+        "stage2",
+        stage2_config,
+        wandb_project=wandb_project,
+    )
 
 
 if __name__ == "__main__":

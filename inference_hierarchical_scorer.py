@@ -34,7 +34,7 @@ from inference_hierarchical import (
 )
 from spatiallm.layout.entity import Bbox
 from spatiallm.model import PointBackboneType
-from train_point_token_scorer import PointTokenScorer, ScorerConfig
+from spatiallm.model.point_token_scorer import PointTokenScorer, ScorerConfig
 
 
 DEFAULT_SCORER_PATH = Path(

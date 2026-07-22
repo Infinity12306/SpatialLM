@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 
-from train_point_token_scorer import (
+from spatiallm.model.point_token_scorer import (
     DEFAULT_PROJECTOR_MODEL_PATH,
     PointTokenCacheDataset,
     PointTokenScorer,

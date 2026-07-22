@@ -34,10 +34,14 @@ class SpatialLMPlugin:
         random_rotation: bool = False,
         point_token_bbox_mask: bool = False,
         point_token_bbox_expand_ratio: float = 0.1,
+        point_cloud_batch_encoding: bool = False,
+        point_token_scorer_gt_mask: bool = False,
     ):
         self.point_token = point_token
         self.point_token_bbox_mask = point_token_bbox_mask
         self.point_token_bbox_expand_ratio = point_token_bbox_expand_ratio
+        self.point_cloud_batch_encoding = point_cloud_batch_encoding
+        self.point_token_scorer_gt_mask = point_token_scorer_gt_mask
 
         default_world_extent = get_world_preset()
         global_extent = get_world_preset(world_size)
@@ -154,6 +158,38 @@ class SpatialLMPlugin:
         # convert list of point clouds to batch with shape (batch_size, max_len, 3)
         return torch.as_tensor(np.stack(points_list, axis=0))
 
+    def _pack_point_clouds(
+        self, point_clouds: Sequence["PointCloudInput"], **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack variable-size point clouds and return cumulative point offsets."""
+        points_list = []
+        offsets = []
+        total_points = 0
+        for point_cloud in point_clouds:
+            if not isinstance(point_cloud, dict):
+                raise ValueError(
+                    "Point cloud input must be a dictionary with 'name' and 'coord' keys."
+                )
+            point_feats = self._preprocess_point_cloud(point_cloud, **kwargs)
+            if len(point_feats) == 0:
+                raise ValueError("Point cloud is empty after preprocessing.")
+            points_list.append(point_feats)
+            total_points += len(point_feats)
+            offsets.append(total_points)
+
+        if not points_list:
+            return (
+                torch.empty((0, 9), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.long),
+            )
+        return (
+            torch.as_tensor(
+                np.concatenate(points_list, axis=0),
+                dtype=torch.float32,
+            ),
+            torch.as_tensor(offsets, dtype=torch.long),
+        )
+
     def _regularize_point_token_keep_bboxes(
         self,
         point_token_keep_bboxes: Sequence[np.ndarray],
@@ -257,13 +293,24 @@ class SpatialLMPlugin:
         if len(processed_messages) != 0:
             input_dict["messages"] = processed_messages
         if len(point_clouds_data) != 0:
-            # convert point clouds to batched tensors with shape (batch_size, max_len, 9)
-            input_dict["point_clouds"] = self._regularize_point_clouds(
-                point_clouds_data
-            )
+            if self.point_cloud_batch_encoding:
+                packed_points, point_offsets = self._pack_point_clouds(
+                    point_clouds_data
+                )
+                input_dict["point_clouds"] = packed_points
+                input_dict["point_cloud_offsets"] = point_offsets
+            else:
+                # Legacy NaN-padded tensor with shape (batch_size, max_len, 9).
+                input_dict["point_clouds"] = self._regularize_point_clouds(
+                    point_clouds_data
+                )
         if self.point_token_bbox_mask:
             input_dict["point_token_keep_bboxes"] = self._regularize_point_token_keep_bboxes(
                 point_token_keep_bboxes
+            )
+        if self.point_token_scorer_gt_mask:
+            input_dict["point_token_scorer_gt_bboxes"] = (
+                self._regularize_point_token_keep_bboxes(point_token_keep_bboxes)
             )
         return input_dict
 
@@ -338,7 +385,7 @@ class SpatialLMPlugin:
                 layout.filter_empty_bboxes(transformed_points, num_points=100)
                 layout.reorder_entities()
                 layout.translate(-min_bound)
-                if self.point_token_bbox_mask:
+                if self.point_token_bbox_mask or self.point_token_scorer_gt_mask:
                     point_token_keep_bboxes = self._bboxes_to_point_token_keep_array(layout)
                 layout.normalize_and_discretize(
                     self.num_bins,

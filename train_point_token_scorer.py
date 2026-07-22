@@ -6,88 +6,31 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
+import sys
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+import yaml
 from torch import nn
 from torch.utils.data import BatchSampler, DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, get_scheduler
 
 import spatiallm  # noqa: F401 - registers custom SpatialLM AutoClasses
+from spatiallm.model.point_token_scorer import PointTokenScorer, ScorerConfig
 
 
 DEFAULT_PROJECTOR_MODEL_PATH = Path(
     "/data2/chenjq24/SpatialLM/saves/hierarchical/"
     "stage2_bboxes_20000_res16_max4096_bbox_mask/checkpoint-14392"
 )
-
-
-@dataclass
-class ScorerConfig:
-    encoder_feature_dim: int
-    point_token_dim: int
-    hidden_dim: int
-    num_layers: int
-    num_heads: int
-    ffn_dim: int
-    dropout: float
-    coord_scale: float
-
-
-class PointTokenScorer(nn.Module):
-    def __init__(self, config: ScorerConfig):
-        super().__init__()
-        self.config = config
-        self.coord_scale = float(config.coord_scale)
-        input_dim = config.point_token_dim + 6
-        self.input_mlp = nn.Sequential(
-            nn.Linear(input_dim, config.hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(config.hidden_dim),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-        )
-        self.position_mlp = nn.Sequential(
-            nn.Linear(3, config.hidden_dim),
-            nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-        )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=config.num_heads,
-            dim_feedforward=config.ffn_dim,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.num_layers,
-        )
-        self.score_head = nn.Linear(config.hidden_dim, 1)
-
-    def forward(
-        self,
-        point_tokens: torch.Tensor,
-        grid_coord: torch.Tensor,
-        region_center_grid_coord: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        denom = max(self.coord_scale - 1.0, 1.0)
-        grid_norm = grid_coord.float() / denom
-        center_norm = region_center_grid_coord.float()[:, None, :] / denom
-        center_norm = center_norm.expand(-1, point_tokens.shape[1], -1)
-        x = torch.cat([point_tokens.float(), grid_norm, center_norm], dim=-1)
-        x = self.input_mlp(x) + self.position_mlp(grid_norm)
-        x = self.encoder(x, src_key_padding_mask=~attention_mask)
-        return self.score_head(x).squeeze(-1)
 
 
 class PointTokenCacheDataset(Dataset):
@@ -280,6 +223,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lr_scheduler_type", default="cosine")
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--hidden_dim", type=int, default=512)
@@ -329,6 +274,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
+        "--auto_resume_from_latest_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--reset_scheduler_on_resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--use_wandb",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -336,7 +291,40 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--wandb_project", default="spatiallm-point-token-scorer")
     parser.add_argument("--wandb_run_name", default=None)
-    args = parser.parse_args()
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_copy_from_run_id", default=None)
+    parser.add_argument("--wandb_copy_from_project", default=None)
+    parser.add_argument("--wandb_copy_from_entity", default=None)
+    parser.add_argument("--wandb_copy_page_size", type=int, default=1000)
+
+    raw_args = sys.argv[1:]
+    if raw_args and Path(raw_args[0]).suffix.lower() in {".yaml", ".yml"}:
+        if len(raw_args) != 1:
+            parser.error("YAML config mode does not accept additional CLI overrides.")
+        config_path = Path(raw_args[0])
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            parser.error(f"Expected YAML mapping: {config_path}")
+        action_by_dest = {action.dest: action for action in parser._actions}
+        unknown = sorted(set(config) - set(action_by_dest))
+        if unknown:
+            parser.error(f"Unknown YAML config keys: {unknown}")
+        for key, value in config.items():
+            action_by_dest[key].required = False
+            parser.set_defaults(**{key: value})
+        raw_args = []
+
+    args = parser.parse_args(raw_args)
+    for key in (
+        "train_cache_dir",
+        "eval_cache_dir",
+        "output_dir",
+        "projector_model_path",
+    ):
+        value = getattr(args, key)
+        if value is not None and not isinstance(value, Path):
+            setattr(args, key, Path(value))
 
     if args.num_train_epochs <= 0:
         parser.error("--num_train_epochs must be positive.")
@@ -344,6 +332,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--per_device_train_batch_size must be positive.")
     if args.gradient_accumulation_steps <= 0:
         parser.error("--gradient_accumulation_steps must be positive.")
+    if args.lr_scheduler_type != "cosine":
+        parser.error("--lr_scheduler_type must be cosine.")
+    if args.warmup_ratio < 0 or args.warmup_ratio > 1:
+        parser.error("--warmup_ratio must be in [0, 1].")
+    if args.use_wandb and (not args.wandb_project or not args.wandb_run_name):
+        parser.error("W&B requires explicit wandb_project and wandb_run_name.")
+    if args.wandb_copy_page_size <= 0:
+        parser.error("--wandb_copy_page_size must be positive.")
     return args
 
 
@@ -484,6 +480,7 @@ def save_checkpoint(
     output_dir: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler,
     step: int,
     config: ScorerConfig,
     args: argparse.Namespace,
@@ -494,6 +491,7 @@ def save_checkpoint(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "step": step,
             "config": asdict(config),
             "args": vars(args),
@@ -502,12 +500,89 @@ def save_checkpoint(
     )
 
 
-def maybe_init_wandb(args: argparse.Namespace):
+def latest_checkpoint(output_dir: Path) -> Path | None:
+    if not output_dir.is_dir():
+        return None
+    checkpoints: list[tuple[int, Path]] = []
+    for child in output_dir.glob("checkpoint-*"):
+        scorer_path = child / "scorer.pt"
+        suffix = child.name.removeprefix("checkpoint-")
+        if child.is_dir() and suffix.isdigit() and scorer_path.is_file():
+            checkpoints.append((int(suffix), child))
+    return max(checkpoints, key=lambda item: item[0])[1] if checkpoints else None
+
+
+def load_checkpoint(
+    checkpoint_dir: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> int:
+    checkpoint = torch.load(checkpoint_dir / "scorer.pt", map_location=device)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    step = int(checkpoint["step"])
+    print(f"Resumed scorer/optimizer from {checkpoint_dir} at step {step}.")
+    return step
+
+
+def copy_wandb_history_until_step(
+    wandb_module,
+    args: argparse.Namespace,
+    max_step: int,
+) -> None:
+    if not args.wandb_copy_from_run_id:
+        return
+    entity = args.wandb_copy_from_entity or args.wandb_entity
+    project = args.wandb_copy_from_project or args.wandb_project
+    if not entity:
+        raise ValueError("W&B clean-copy requires wandb_entity or source entity.")
+    source = wandb_module.Api().run(
+        f"{entity}/{project}/{args.wandb_copy_from_run_id}"
+    )
+    copied = 0
+    for row in source.scan_history(page_size=args.wandb_copy_page_size):
+        step = row.get("_step")
+        if step is None or int(step) > max_step:
+            continue
+        payload = {
+            key: value
+            for key, value in row.items()
+            if not key.startswith("_") and value is not None
+        }
+        if payload:
+            wandb_module.log(payload, step=int(step))
+            copied += 1
+    print(f"Clean-copied W&B history through step {max_step}: rows={copied}")
+
+
+def maybe_init_wandb(args: argparse.Namespace, resume_step: int | None = None):
     if not args.use_wandb:
         return None
     import wandb
 
-    wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+    os.environ.pop("WANDB_RUN_ID", None)
+    os.environ.pop("WANDB_RESUME", None)
+
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    config["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    init_kwargs = {
+        "project": args.wandb_project,
+        "name": args.wandb_run_name,
+        "config": config,
+    }
+    if args.wandb_entity:
+        init_kwargs["entity"] = args.wandb_entity
+    wandb.init(**init_kwargs)
+    if args.wandb_copy_from_run_id:
+        if resume_step is None:
+            raise RuntimeError(
+                "wandb_copy_from_run_id requires a resumed local checkpoint."
+            )
+        copy_wandb_history_until_step(wandb, args, resume_step)
     return wandb
 
 
@@ -515,14 +590,26 @@ def main() -> None:
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    if args.output_dir.exists():
-        if not args.overwrite_output_dir:
-            raise FileExistsError(
-                f"Output directory exists: {args.output_dir}. "
-                "Use --overwrite_output_dir to replace it."
-            )
+    resume_checkpoint: Path | None = None
+    if args.output_dir.exists() and args.overwrite_output_dir:
         shutil.rmtree(args.output_dir)
+    elif args.output_dir.exists() and args.auto_resume_from_latest_checkpoint:
+        resume_checkpoint = latest_checkpoint(args.output_dir)
+        if resume_checkpoint is not None:
+            print(f"Auto-resuming scorer from {resume_checkpoint}")
+        elif any(args.output_dir.iterdir()):
+            raise FileExistsError(
+                f"Output directory is non-empty but has no scorer checkpoint: "
+                f"{args.output_dir}"
+            )
+    elif args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise FileExistsError(
+            f"Output directory already exists: {args.output_dir}. Enable auto-resume "
+            "or choose a new output directory."
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -575,13 +662,14 @@ def main() -> None:
     )
     model = PointTokenScorer(config).to(device)
 
-    if args.pos_weight == "auto":
+    pos_weight_value = str(args.pos_weight).lower()
+    if pos_weight_value == "auto":
         positive = train_dataset.positive_count
         negative = train_dataset.token_count - positive
         value = negative / max(positive, 1)
         pos_weight = torch.tensor(value, dtype=torch.float32, device=device)
         print(f"Using auto pos_weight={value:.4f}")
-    elif args.pos_weight.lower() in {"none", "0"}:
+    elif pos_weight_value in {"none", "0"}:
         pos_weight = None
     else:
         pos_weight = torch.tensor(float(args.pos_weight), dtype=torch.float32, device=device)
@@ -636,17 +724,75 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    wandb = maybe_init_wandb(args)
     global_step = 0
+    if resume_checkpoint is not None:
+        global_step = load_checkpoint(resume_checkpoint, model, optimizer, device)
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate
+            group["initial_lr"] = args.learning_rate
+
+    micro_batches_per_epoch = len(train_loader)
+    if micro_batches_per_epoch <= 0:
+        raise RuntimeError("Train dataloader is empty.")
+    steps_per_epoch = math.ceil(
+        micro_batches_per_epoch / args.gradient_accumulation_steps
+    )
+    total_training_steps = steps_per_epoch * args.num_train_epochs
+    remaining_steps = max(total_training_steps - global_step, 0)
+    warmup_steps = int(remaining_steps * args.warmup_ratio)
+    scheduler = get_scheduler(
+        args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max(remaining_steps, 1),
+    )
+    if resume_checkpoint is not None and not args.reset_scheduler_on_resume:
+        saved = torch.load(
+            resume_checkpoint / "scorer.pt", map_location="cpu"
+        ).get("scheduler")
+        if saved is not None:
+            scheduler.load_state_dict(saved)
+    print(
+        "Scorer training schedule: "
+        f"micro_batches_per_epoch={micro_batches_per_epoch}, "
+        f"steps_per_epoch={steps_per_epoch}, total_steps={total_training_steps}, "
+        f"start_step={global_step}, remaining_steps={remaining_steps}, "
+        f"warmup_steps={warmup_steps}"
+    )
+    wandb = maybe_init_wandb(
+        args, global_step if resume_checkpoint is not None else None
+    )
+    if global_step >= total_training_steps:
+        print("No remaining scorer training steps.")
+        if wandb is not None:
+            wandb.finish()
+        return
+
+    start_epoch = min(global_step // steps_per_epoch, args.num_train_epochs)
+    completed_steps_in_epoch = global_step % steps_per_epoch
+    skip_micro_batches = min(
+        completed_steps_in_epoch * args.gradient_accumulation_steps,
+        micro_batches_per_epoch,
+    )
     running_loss = 0.0
     running_tokens = 0
     optimizer.zero_grad(set_to_none=True)
 
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(start_epoch, args.num_train_epochs):
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch)
-        progress = tqdm(train_loader, desc=f"train epoch {epoch}")
-        for micro_step, batch in enumerate(progress, start=1):
+        progress = tqdm(
+            train_loader,
+            desc=f"train epoch {epoch}",
+            total=micro_batches_per_epoch,
+            initial=skip_micro_batches if epoch == start_epoch else 0,
+        )
+        trained_micro_steps = 0
+        for raw_micro_step, batch in enumerate(progress, start=1):
+            if epoch == start_epoch and raw_micro_step <= skip_micro_batches:
+                continue
+            if global_step >= total_training_steps:
+                break
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             point_tokens = project_encoder_features(point_projector, batch["features"])
             logits = model(
@@ -665,19 +811,26 @@ def main() -> None:
             tokens = int(batch["attention_mask"].sum().item())
             running_loss += float(loss.item()) * tokens
             running_tokens += tokens
+            trained_micro_steps += 1
 
-            if micro_step % args.gradient_accumulation_steps != 0:
+            if trained_micro_steps % args.gradient_accumulation_steps != 0:
                 continue
 
             if args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
             if global_step % args.logging_steps == 0:
                 train_loss = running_loss / max(running_tokens, 1)
-                log = {"train/loss": train_loss, "step": global_step, "epoch": epoch}
+                log = {
+                    "train/loss": train_loss,
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "step": global_step,
+                    "epoch": epoch,
+                }
                 print(f"step={global_step} epoch={epoch} train_loss={train_loss:.6f}")
                 if wandb is not None:
                     wandb.log(log, step=global_step)
@@ -709,16 +862,38 @@ def main() -> None:
                     wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=global_step)
 
             if global_step % args.save_steps == 0:
-                save_checkpoint(args.output_dir, model, optimizer, global_step, config, args)
+                save_checkpoint(
+                    args.output_dir,
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    config,
+                    args,
+                )
 
-        if micro_step % args.gradient_accumulation_steps != 0:
+        if (
+            trained_micro_steps > 0
+            and trained_micro_steps % args.gradient_accumulation_steps != 0
+            and global_step < total_training_steps
+        ):
             if args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+        skip_micro_batches = 0
 
-    save_checkpoint(args.output_dir, model, optimizer, global_step, config, args)
+    save_checkpoint(
+        args.output_dir,
+        model,
+        optimizer,
+        scheduler,
+        global_step,
+        config,
+        args,
+    )
     if wandb is not None:
         wandb.finish()
 

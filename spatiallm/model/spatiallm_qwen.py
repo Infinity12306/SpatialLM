@@ -29,6 +29,7 @@ from spatiallm.model import (
     ProjectorType,
     center_crop_point_tokens,
 )
+from spatiallm.model.point_token_scorer import score_and_select_point_tokens
 
 IGNORE_INDEX = -100
 logger = logging.get_logger(__name__)
@@ -140,6 +141,83 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         else:
             raise ValueError(f"Unknown point backbone type: {self.point_backbone_type}")
 
+    def forward_point_cloud_batch(self, point_cloud, offsets, device, dtype):
+        """Encode a packed local batch with one Sonata forward call."""
+        if self.point_backbone_type != PointBackboneType.SONATA:
+            raise NotImplementedError(
+                "Packed point-cloud batch encoding currently supports Sonata only."
+            )
+        if point_cloud.ndim != 2 or point_cloud.shape[-1] < 9:
+            raise ValueError(
+                "Packed point_cloud must have shape [sum_points, 9], "
+                f"got {tuple(point_cloud.shape)}"
+            )
+        if offsets.ndim != 1 or offsets.numel() == 0:
+            raise ValueError("point_cloud_offsets must be a non-empty 1D tensor.")
+        coords = point_cloud[:, :3].to(device=device, dtype=torch.int64)
+        feats = point_cloud[:, 3:].to(device=device, dtype=torch.float32)
+        encoded = self.point_backbone(
+            {
+                "coord": feats[:, :3],
+                "grid_coord": coords,
+                "feat": feats,
+                "offset": offsets.to(device=device, dtype=torch.long),
+                "return_grid_coord": True,
+            }
+        )
+        encoded["point_tokens"] = self.point_proj(encoded["context"].to(dtype))
+        return encoded
+
+    def _packed_point_features(
+        self,
+        point_cloud,
+        point_cloud_offsets,
+        point_token_scorer_gt_bboxes,
+        device,
+        dtype,
+    ):
+        encoded = self.forward_point_cloud_batch(
+            point_cloud, point_cloud_offsets, device, dtype
+        )
+        scorer = getattr(self, "point_token_scorer", None)
+        if point_token_scorer_gt_bboxes is not None:
+            if scorer is None:
+                raise RuntimeError(
+                    "point_token_scorer_gt_bboxes were provided but no "
+                    "point_token_scorer is attached to the model."
+                )
+            max_keep = getattr(self, "point_token_scorer_max_keep", None)
+            if max_keep is None:
+                max_keep = self.max_point_tokens or encoded["point_tokens"].shape[0]
+            selected, scorer_loss, scorer_metrics = score_and_select_point_tokens(
+                scorer=scorer,
+                point_tokens=encoded["point_tokens"],
+                grid_coord=encoded["grid_coord"],
+                token_batch=encoded["batch"],
+                gt_bboxes=point_token_scorer_gt_bboxes,
+                voxel_size=self.point_backbone.final_voxel_size,
+                threshold=float(getattr(self, "point_token_scorer_threshold", 0.5)),
+                min_keep=int(getattr(self, "point_token_scorer_min_keep", 1)),
+                max_keep=int(max_keep),
+                pos_weight=getattr(self, "point_token_scorer_pos_weight", None),
+                detach_scorer_input=bool(
+                    getattr(self, "point_token_scorer_detach_input", True)
+                ),
+            )
+            self._joint_scorer_loss = scorer_loss
+            self._last_joint_metrics.update(scorer_metrics)
+            return selected
+
+        point_features = []
+        start = 0
+        for end in encoded["offset"].tolist():
+            features = center_crop_point_tokens(
+                encoded["point_tokens"][start:end], self.max_point_tokens
+            )
+            point_features.append(features.unsqueeze(0))
+            start = end
+        return point_features
+
     def set_point_backbone_dtype(self, dtype: torch.dtype):
         for param in self.point_backbone.parameters():
             param.data = param.data.to(dtype)
@@ -162,7 +240,9 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
         point_clouds: Optional[torch.Tensor] = None,
+        point_cloud_offsets: Optional[torch.Tensor] = None,
         point_token_keep_bboxes: Optional[torch.Tensor] = None,
+        point_token_scorer_gt_bboxes: Optional[torch.Tensor] = None,
         point_token_features: Optional[torch.Tensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -218,6 +298,8 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
             inputs_embeds = self.model.embed_tokens(input_ids)
 
         point_start_end_token_pos = []
+        self._joint_scorer_loss = None
+        self._last_joint_metrics = {}
         has_point_inputs = point_clouds is not None or point_token_features is not None
         if (
             self.point_backbone is not None
@@ -225,7 +307,24 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
             and has_point_inputs
         ):
             point_features = []
-            if point_token_features is not None:
+            if point_cloud_offsets is not None:
+                if point_token_features is not None:
+                    raise ValueError(
+                        "point_cloud_offsets cannot be combined with point_token_features."
+                    )
+                if point_token_keep_bboxes is not None:
+                    raise ValueError(
+                        "Packed batch encoding cannot currently be combined with "
+                        "oracle point_token_keep_bboxes."
+                    )
+                point_features = self._packed_point_features(
+                    point_clouds,
+                    point_cloud_offsets,
+                    point_token_scorer_gt_bboxes,
+                    inputs_embeds.device,
+                    inputs_embeds.dtype,
+                )
+            elif point_token_features is not None:
                 n_point_clouds = point_token_features.shape[0]
                 for i in range(n_point_clouds):  # * iterate over batch
                     cur_point_features = point_token_features[i]
@@ -392,6 +491,16 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 **loss_kwargs,
             )
 
+        if self._joint_scorer_loss is not None:
+            scorer_weight = float(getattr(self, "point_token_scorer_loss_weight", 1.0))
+            lm_loss = loss
+            scorer_term = self._joint_scorer_loss * scorer_weight
+            loss = scorer_term if lm_loss is None else lm_loss + scorer_term
+            self._last_joint_metrics["lm_loss"] = (
+                lm_loss.detach() if lm_loss is not None else loss.new_zeros(())
+            )
+            self._last_joint_metrics["joint_loss"] = loss.detach()
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -427,9 +536,13 @@ class SpatialLMQwenForCausalLM(Qwen2ForCausalLM):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "point_clouds": kwargs.get("point_clouds", None),
+                "point_cloud_offsets": kwargs.get("point_cloud_offsets", None),
                 "point_token_keep_bboxes": kwargs.get(
                     "point_token_keep_bboxes",
                     None,
+                ),
+                "point_token_scorer_gt_bboxes": kwargs.get(
+                    "point_token_scorer_gt_bboxes", None
                 ),
                 "point_token_features": kwargs.get("point_token_features", None),
             }
